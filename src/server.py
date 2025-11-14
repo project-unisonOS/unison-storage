@@ -3,20 +3,33 @@ import uvicorn
 import logging
 import json
 import time
-import os
 import sqlite3
+from pathlib import Path
 from typing import Any
 from unison_common.logging import configure_logging, log_json
+from unison_common.tracing_middleware import TracingMiddleware
+from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
 from collections import defaultdict
 
+from .settings import StorageServiceSettings
+
 app = FastAPI(title="unison-storage")
+app.add_middleware(TracingMiddleware, service_name="unison-storage")
 
 logger = configure_logging("unison-storage")
+
+# P0.3: Initialize tracing and instrument FastAPI/httpx
+initialize_tracing()
+instrument_fastapi(app)
+instrument_httpx()
 
 # Simple in-memory metrics
 _metrics = defaultdict(int)
 _start_time = time.time()
+SETTINGS = StorageServiceSettings.from_env()
 
+
+@app.get("/healthz")
 @app.get("/health")
 def health(request: Request):
     _metrics["/health"] += 1
@@ -42,6 +55,7 @@ def metrics():
     ])
     return "\n".join(lines)
 
+@app.get("/readyz")
 @app.get("/ready")
 def ready(request: Request):
     event_id = request.headers.get("X-Event-ID")
@@ -50,11 +64,10 @@ def ready(request: Request):
     return {"ready": True}
 
 
-DB_PATH = os.getenv("UNISON_STORAGE_DB", "/data/store.db")
-
 def _db_conn():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    db_path: Path = SETTINGS.db_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
     conn.execute(
         "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (ns, key))"
     )
