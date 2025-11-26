@@ -9,12 +9,18 @@ from typing import Any
 from unison_common.logging import configure_logging, log_json
 from unison_common.tracing_middleware import TracingMiddleware
 from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
+try:
+    from unison_common import BatonMiddleware
+except Exception:
+    BatonMiddleware = None
 from collections import defaultdict
 
-from .settings import StorageServiceSettings
+from settings import StorageServiceSettings
 
 app = FastAPI(title="unison-storage")
 app.add_middleware(TracingMiddleware, service_name="unison-storage")
+if BatonMiddleware:
+    app.add_middleware(BatonMiddleware)
 
 logger = configure_logging("unison-storage")
 
