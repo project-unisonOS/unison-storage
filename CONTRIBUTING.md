@@ -16,7 +16,7 @@ All contributions — code, documentation, research, or accessibility testing �
 ### Branching Model
 - **`main`** – stable, production-ready branch.  
 - **`dev`** – active development integration branch.  
-- **feature/*** or **fix/*** – short-lived branches for specific changes.
+- `feature/*` or `fix/*` – short-lived branches for specific changes.
 
 ### Workflow Summary
 1. Fork the repository and create your feature branch:  

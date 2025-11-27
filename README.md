@@ -2,6 +2,9 @@
 
 The storage service provides secure, partitioned data persistence for the Unison platform, handling working memory, long-term storage, and sensitive data protection.
 
+## Status
+Core service (active) — storage/vault for orchestrator/context; devstack port `8082`.
+
 ## Purpose
 
 The storage service:
@@ -41,37 +44,30 @@ The storage service:
 
 ### Local Development
 ```bash
-# Clone and setup
 git clone https://github.com/project-unisonOS/unison-storage
 cd unison-storage
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Run with default configuration
-export STORAGE_ENCRYPTION_KEY="your-256-bit-key"
+python3 -m venv .venv && . .venv/bin/activate
+pip install -c ../constraints.txt -r requirements.txt
+cp .env.example .env  # set STORAGE_ENCRYPTION_KEY to a 256-bit secret
 python src/server.py
 ```
 
 ### Docker Deployment
 ```bash
-# Using the development stack
 cd ../unison-devstack
-docker-compose up -d storage
-
-# Health check
+docker compose up -d storage
 curl http://localhost:8082/health
 ```
 
 ### Security-Hardened Deployment
 ```bash
-# Using the security configuration
 cd ../unison-devstack
-docker-compose -f docker-compose.security.yml up -d
-
-# Access through internal network
+docker compose -f docker-compose.security.yml up -d
 curl http://storage:8082/health
 ```
+
+Copy `.env.example` to `.env` for local runs and set strong secrets before production.
 
 ## API Reference
 
@@ -113,7 +109,8 @@ curl -X POST http://localhost:8082/vault \
   }'
 ```
 
-[Full API Documentation](../../unison-docs/developer/api-reference/storage.md)
+Additional docs: workspace `docs/unison-architecture-overview.md` and `docs/developer-guide.md` cover how this service
+fits into the platform; legacy `unison-docs` references are archived.
 
 ## Configuration
 
@@ -204,28 +201,10 @@ pip install -r requirements-dev.txt
 python scripts/init_db.py
 
 # Run tests
-pytest tests/
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OTEL_SDK_DISABLED=true python -m pytest
 
 # Run with debug logging
 LOG_LEVEL=DEBUG python src/server.py
-```
-
-### Testing
-```bash
-# Unit tests
-pytest tests/unit/
-
-# Integration tests
-pytest tests/integration/
-
-# Security tests
-pytest tests/security/
-
-# Performance tests
-pytest tests/performance/
-
-# Encryption tests
-pytest tests/encryption/
 ```
 
 ### Contributing
@@ -234,8 +213,6 @@ pytest tests/encryption/
 3. Make your changes with comprehensive tests
 4. Ensure all security and privacy tests pass
 5. Submit a pull request with detailed description
-
-[Development Guide](../../unison-docs/developer/contributing.md)
 
 ## Security and Privacy
 
@@ -258,8 +235,6 @@ pytest tests/encryption/
 - **SOC 2 Controls**: Security and compliance controls implemented
 - **Data Residency**: Control over data storage location
 - **Breach Notification**: Automated breach detection and notification
-
-[Security Documentation](../../unison-docs/operations/security.md)
 
 ## Architecture
 
@@ -293,8 +268,6 @@ pytest tests/encryption/
 5. **Audit**: Log operation for compliance
 6. **Response**: Return operation confirmation
 
-[Architecture Documentation](../../unison-docs/developer/architecture.md)
-
 ## Monitoring
 
 ### Health Checks
@@ -318,8 +291,6 @@ Structured JSON logging with correlation IDs:
 - Performance metrics and bottlenecks
 - Error tracking and recovery
 - Compliance and audit events
-
-[Monitoring Guide](../../unison-docs/operations/monitoring.md)
 
 ## Backup and Recovery
 
@@ -346,8 +317,6 @@ python scripts/restore.py \
 - **Cross-Region Recovery**: Restore from alternative region backups
 - **Validation**: Automated integrity checks after recovery
 
-[Backup and Recovery Guide](../../unison-docs/operations/backup-recovery.md)
-
 ## Related Services
 
 ### Dependencies
@@ -365,7 +334,7 @@ python scripts/restore.py \
 
 ### Common Issues
 
-**Storage Not Responding**
+### Storage Not Responding
 ```bash
 # Check service health
 curl http://localhost:8082/health
@@ -374,10 +343,10 @@ curl http://localhost:8082/health
 curl http://localhost:8082/ready
 
 # Check database connection pool
-docker-compose logs storage | grep "database"
+docker compose logs storage | grep "database"
 ```
 
-**Encryption/Decryption Errors**
+### Encryption/Decryption Errors
 ```bash
 # Verify encryption key
 grep STORAGE_ENCRYPTION_KEY .env
@@ -390,13 +359,13 @@ curl -X GET http://localhost:8082/keys/status \
   -H "Authorization: Bearer <token>"
 ```
 
-**Performance Issues**
+### Performance Issues
 ```bash
 # Check storage metrics
 curl http://localhost:8082/metrics
 
 # Monitor query performance
-docker-compose logs storage | grep "slow_query"
+docker compose logs storage | grep "slow_query"
 
 # Check cache efficiency
 curl -X GET http://localhost:8082/cache/stats \
@@ -409,13 +378,11 @@ curl -X GET http://localhost:8082/cache/stats \
 LOG_LEVEL=DEBUG STORAGE_DEBUG_QUERIES=true python src/server.py
 
 # Monitor storage operations
-docker-compose logs -f storage | jq '.'
+docker compose logs -f storage | jq '.'
 
 # Test storage functionality
 python scripts/diagnostic.py --all
 ```
-
-[Troubleshooting Guide](../../unison-docs/people/troubleshooting.md)
 
 ## Version Compatibility
 
@@ -432,7 +399,6 @@ Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 ## Support
 
-- **Documentation**: [Project Unison Docs](https://github.com/project-unisonOS/unison-docs)
 - **Issues**: [GitHub Issues](https://github.com/project-unisonOS/unison-storage/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/project-unisonOS/unison-storage/discussions)
-- **Security**: Report security issues to security@unisonos.org
+- **Security**: Report security issues to [security@unisonos.org](mailto:security@unisonos.org)

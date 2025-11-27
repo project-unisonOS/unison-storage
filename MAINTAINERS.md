@@ -24,13 +24,13 @@ When changes span multiple modules:
    3. `unison-context`  
    4. `unison-storage`  
    5. `unison-devstack`  
-   6. `unison-docs`
+   6. workspace docs (../docs)
 
 ---
 
 ## 3. Release Notes
 Each repo should include a short `CHANGELOG.md` entry:
-```
+```bash
 ## [v0.3.1] – 2025-10-25
 ### Added
 - Context service memory retention metrics  
@@ -48,7 +48,7 @@ Each repo should include a short `CHANGELOG.md` entry:
 ---
 
 ## 5. Documentation Sync
-- Update `unison-docs` for any architectural or behavior change.  
+- Update workspace docs (`../docs/`) and the service README; `unison-docs` is archived.  
 - Ensure diagram and schema versions match tagged release versions.
 
 ---

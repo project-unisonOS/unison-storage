@@ -27,12 +27,16 @@ Recommended core repos to clone locally:
 - `unison-context`
 - `unison-storage`
 - `unison-devstack`
-- `unison-docs`
+- `unison-policy`
+- `unison-auth`
+- `unison-common`
 
 Keep all under a shared parent folder, e.g.:
 ```
 /git/unison/
 ```
+
+Workspace docs live at the root `docs/` directory; `unison-docs` is archived.
 
 ---
 
@@ -54,6 +58,15 @@ docker compose ps
 Verify orchestration:
 ```bash
 curl http://localhost:8080/health
+```
+
+Or run the storage service alone for local dev:
+```bash
+cd ../unison-storage
+python3 -m venv .venv && . .venv/bin/activate
+pip install -c ../constraints.txt -r requirements.txt
+cp .env.example .env  # set STORAGE_ENCRYPTION_KEY to a 256-bit secret
+python src/server.py
 ```
 
 ---
