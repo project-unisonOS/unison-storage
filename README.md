@@ -109,7 +109,7 @@ curl -X POST http://localhost:8082/vault \
   }'
 ```
 
-Additional docs: workspace `docs/unison-architecture-overview.md` and `docs/developer-guide.md` cover how this service
+Additional docs: workspace `unison-docs/dev/unison-architecture-overview.md` and `unison-docs/dev/developer-guide.md` cover how this service
 fits into the platform; legacy `unison-docs` references are archived.
 
 ## Configuration
@@ -391,7 +391,7 @@ python scripts/diagnostic.py --all
 | 1.0.0           | 1.0.0         | 1.0.0        | 20.10+         |
 | 0.9.x           | 0.9.x         | 0.9.x        | 20.04+         |
 
-[Compatibility Matrix](../../unison-spec/specs/version-compatibility.md)
+[Compatibility Matrix](../unison-docs/dev/compatibility-matrix.md)
 
 ## License
 
