@@ -12,11 +12,13 @@ class StorageServiceSettings:
     """Top-level configuration surface."""
 
     db_path: Path = Path("/data/store.db")
+    database_url: str = ""
 
     @classmethod
     def from_env(cls) -> "StorageServiceSettings":
         return cls(
             db_path=Path(os.getenv("UNISON_STORAGE_DB", "/data/store.db")),
+            database_url=os.getenv("STORAGE_DATABASE_URL", ""),
         )
 
 

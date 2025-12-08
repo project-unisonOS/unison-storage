@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, Request, Body
 import uvicorn
 import logging
@@ -9,6 +11,8 @@ from typing import Any
 from unison_common.logging import configure_logging, log_json
 from unison_common.tracing_middleware import TracingMiddleware
 from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 try:
     from unison_common import BatonMiddleware
 except Exception:
@@ -33,6 +37,7 @@ instrument_httpx()
 _metrics = defaultdict(int)
 _start_time = time.time()
 SETTINGS = StorageServiceSettings.from_env()
+_ENGINE: Engine | None = None
 
 
 @app.get("/healthz")
@@ -70,14 +75,21 @@ def ready(request: Request):
     return {"ready": True}
 
 
-def _db_conn():
-    db_path: Path = SETTINGS.db_path
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (ns, key))"
-    )
-    return conn
+def _init_engine() -> Engine:
+    global _ENGINE
+    if _ENGINE:
+        return _ENGINE
+    db_url = SETTINGS.database_url or f"sqlite:///{SETTINGS.db_path}"
+    if db_url.startswith("sqlite:///"):
+        Path(db_url.replace("sqlite:///", "")).parent.mkdir(parents=True, exist_ok=True)
+    _ENGINE = create_engine(db_url, future=True)
+    with _ENGINE.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (ns, key))"
+            )
+        )
+    return _ENGINE
 
 
 @app.put("/kv/{namespace}/{key}")
@@ -89,10 +101,16 @@ def kv_put(namespace: str, key: str, request: Request, body: dict = Body(...)):
     val: Any = body.get("value") if isinstance(body, dict) else None
     try:
         encoded = json.dumps(val, separators=(",", ":"))
-        with _db_conn() as conn:
+        engine = _init_engine()
+        with engine.begin() as conn:
             conn.execute(
-                "INSERT INTO kv(ns, key, value) VALUES(?,?,?) ON CONFLICT(ns,key) DO UPDATE SET value=excluded.value",
-                (namespace, key, encoded),
+                text(
+                    """
+                    INSERT INTO kv(ns, key, value) VALUES(:ns, :key, :val)
+                    ON CONFLICT(ns,key) DO UPDATE SET value=excluded.value
+                    """
+                ),
+                {"ns": namespace, "key": key, "val": encoded},
             )
         log_json(logging.INFO, "kv_put", service="unison-storage", event_id=event_id, ns=namespace, key=key)
         return {"ok": True, "event_id": event_id}
@@ -106,9 +124,11 @@ def kv_get(namespace: str, key: str, request: Request):
     _metrics["/kv/{namespace}/{key}"] += 1
     event_id = request.headers.get("X-Event-ID")
     try:
-        with _db_conn() as conn:
-            cur = conn.execute("SELECT value FROM kv WHERE ns=? AND key=?", (namespace, key))
-            row = cur.fetchone()
+        engine = _init_engine()
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT value FROM kv WHERE ns=:ns AND key=:key"), {"ns": namespace, "key": key}
+            ).fetchone()
         value = json.loads(row[0]) if row and row[0] is not None else None
         log_json(logging.INFO, "kv_get", service="unison-storage", event_id=event_id, ns=namespace, key=key, hit=value is not None)
         return {"ok": True, "value": value, "event_id": event_id}
