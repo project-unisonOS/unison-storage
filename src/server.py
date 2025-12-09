@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Request, Body, HTTPException
+from fastapi import FastAPI, Request, Body, HTTPException, Depends
 import uvicorn
 import logging
 import json
@@ -16,6 +16,8 @@ from sqlalchemy.engine import Engine
 import base64
 import os
 import uuid
+import hashlib
+from cryptography.fernet import Fernet
 try:
     from unison_common import BatonMiddleware
 except Exception:
@@ -41,6 +43,7 @@ _metrics = defaultdict(int)
 _start_time = time.time()
 SETTINGS = StorageServiceSettings.from_env()
 _ENGINE: Engine | None = None
+_FERNET: Optional[Fernet] = None
 
 
 @app.get("/healthz")
@@ -168,6 +171,28 @@ def _init_engine() -> Engine:
     return _ENGINE
 
 
+def _get_fernet() -> Optional[Fernet]:
+    global _FERNET
+    if _FERNET is not None:
+        return _FERNET
+    if SETTINGS.object_enc_key:
+        try:
+            _FERNET = Fernet(SETTINGS.object_enc_key.encode())
+        except Exception:
+            _FERNET = None
+    return _FERNET
+
+
+def _check_auth(request: Request):
+    token = SETTINGS.service_token
+    if not token:
+        return
+    auth = request.headers.get("Authorization", "")
+    supplied = auth.replace("Bearer ", "").strip()
+    if supplied != token:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
 @app.put("/kv/{namespace}/{key}")
 def kv_put(namespace: str, key: str, request: Request, body: dict = Body(...)):
     _metrics["/kv/{namespace}/{key}"] += 1
@@ -215,7 +240,7 @@ def kv_get(namespace: str, key: str, request: Request):
 
 # --- Memory (TTL) ---
 @app.post("/memory")
-def memory_put(request: Request, body: dict = Body(...)):
+def memory_put(request: Request, body: dict = Body(...), _: None = Depends(_check_auth)):
     """Store memory payload with optional TTL (seconds)."""
     _metrics["/memory"] += 1
     session_id = body.get("session_id")
@@ -249,7 +274,7 @@ def memory_put(request: Request, body: dict = Body(...)):
 
 
 @app.get("/memory/{session_id}")
-def memory_get(session_id: str):
+def memory_get(session_id: str, _: None = Depends(_check_auth)):
     engine = _init_engine()
     with engine.begin() as conn:
         row = conn.execute(
@@ -272,7 +297,7 @@ def memory_get(session_id: str):
 
 
 @app.delete("/memory/{session_id}")
-def memory_delete(session_id: str):
+def memory_delete(session_id: str, _: None = Depends(_check_auth)):
     engine = _init_engine()
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM memory_entries WHERE session_id=:sid"), {"sid": session_id})
@@ -281,7 +306,7 @@ def memory_delete(session_id: str):
 
 # --- Vault ---
 @app.post("/vault")
-def vault_put(body: dict = Body(...)):
+def vault_put(body: dict = Body(...), _: None = Depends(_check_auth)):
     key_id = body.get("key_id") or body.get("id") or str(uuid.uuid4())
     cipher_text = body.get("cipher_text") or body.get("data")
     metadata = body.get("metadata") or {}
@@ -307,7 +332,7 @@ def vault_put(body: dict = Body(...)):
 
 
 @app.get("/vault/{key_id}")
-def vault_get(key_id: str):
+def vault_get(key_id: str, _: None = Depends(_check_auth)):
     engine = _init_engine()
     with engine.begin() as conn:
         row = conn.execute(
@@ -329,7 +354,7 @@ def vault_get(key_id: str):
 
 # --- Audit ---
 @app.post("/audit")
-def audit_log(body: dict = Body(...)):
+def audit_log(body: dict = Body(...), _: None = Depends(_check_auth)):
     event_id = body.get("id") or str(uuid.uuid4())
     engine = _init_engine()
     with engine.begin() as conn:
@@ -364,7 +389,7 @@ def _objects_dir() -> Path:
 
 
 @app.post("/objects")
-def object_put(body: dict = Body(...)):
+def object_put(body: dict = Body(...), request: Request = None, _: None = Depends(_check_auth)):
     obj_id = body.get("id") or str(uuid.uuid4())
     content_b64 = body.get("content_b64")
     content_type = body.get("content_type") or "application/octet-stream"
@@ -375,6 +400,10 @@ def object_put(body: dict = Body(...)):
     path: Optional[str] = None
     if content_b64:
         data = base64.b64decode(content_b64)
+        checksum = hashlib.sha256(data).hexdigest()
+        fernet = _get_fernet()
+        if fernet:
+            data = fernet.encrypt(data)
         target = _objects_dir() / obj_id
         target.write_bytes(data)
         path = str(target)
@@ -408,7 +437,7 @@ def object_put(body: dict = Body(...)):
 
 
 @app.get("/objects/{obj_id}")
-def object_get(obj_id: str):
+def object_get(obj_id: str, _: None = Depends(_check_auth)):
     engine = _init_engine()
     with engine.begin() as conn:
         row = conn.execute(
@@ -425,7 +454,14 @@ def object_get(obj_id: str):
     person_id, content_type, size_bytes, backend, path, checksum = row
     content_b64 = None
     if path and Path(path).exists():
-        content_b64 = base64.b64encode(Path(path).read_bytes()).decode()
+        data = Path(path).read_bytes()
+        fernet = _get_fernet()
+        if fernet:
+            try:
+                data = fernet.decrypt(data)
+            except Exception:
+                pass
+        content_b64 = base64.b64encode(data).decode()
     return {
         "ok": True,
         "id": obj_id,
