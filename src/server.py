@@ -249,6 +249,8 @@ def memory_put(request: Request, body: dict = Body(...), _: None = Depends(_chec
     ttl = body.get("ttl") or body.get("ttl_seconds")
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id required")
+    if payload is None:
+        raise HTTPException(status_code=400, detail="data required")
     expires_at = None
     if isinstance(ttl, (int, float)) and ttl > 0:
         expires_at = time.time() + float(ttl)
@@ -310,7 +312,7 @@ def vault_put(body: dict = Body(...), _: None = Depends(_check_auth)):
     key_id = body.get("key_id") or body.get("id") or str(uuid.uuid4())
     cipher_text = body.get("cipher_text") or body.get("data")
     metadata = body.get("metadata") or {}
-    if not cipher_text:
+    if not cipher_text or not isinstance(cipher_text, str):
         raise HTTPException(status_code=400, detail="cipher_text required")
     engine = _init_engine()
     with engine.begin() as conn:
@@ -356,6 +358,10 @@ def vault_get(key_id: str, _: None = Depends(_check_auth)):
 @app.post("/audit")
 def audit_log(body: dict = Body(...), _: None = Depends(_check_auth)):
     event_id = body.get("id") or str(uuid.uuid4())
+    actor = body.get("actor")
+    action = body.get("action")
+    if not action:
+        raise HTTPException(status_code=400, detail="action required")
     engine = _init_engine()
     with engine.begin() as conn:
         conn.execute(
@@ -369,8 +375,8 @@ def audit_log(body: dict = Body(...), _: None = Depends(_check_auth)):
             {
                 "id": event_id,
                 "person_id": body.get("person_id"),
-                "actor": body.get("actor"),
-                "action": body.get("action"),
+                "actor": actor,
+                "action": action,
                 "target": body.get("target"),
                 "decision_id": body.get("decision_id"),
                 "status": body.get("status"),
@@ -399,7 +405,10 @@ def object_put(body: dict = Body(...), request: Request = None, _: None = Depend
     size_bytes: Optional[int] = None
     path: Optional[str] = None
     if content_b64:
-        data = base64.b64decode(content_b64)
+        try:
+            data = base64.b64decode(content_b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid base64 content")
         checksum = hashlib.sha256(data).hexdigest()
         fernet = _get_fernet()
         if fernet:
@@ -408,6 +417,8 @@ def object_put(body: dict = Body(...), request: Request = None, _: None = Depend
         target.write_bytes(data)
         path = str(target)
         size_bytes = len(data)
+    else:
+        raise HTTPException(status_code=400, detail="content_b64 required")
     engine = _init_engine()
     with engine.begin() as conn:
         conn.execute(
