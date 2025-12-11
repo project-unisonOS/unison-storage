@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-security:
+    uses: project-unisonOS/.github/.github/workflows/reusable-python-security.yml@main
+    with:
+      python-version: "3.11"
+      working-directory: "."
+
+  container-supply-chain:
+    uses: project-unisonOS/.github/.github/workflows/reusable-container-supply-chain.yml@main
+    with:
+      image-name: unison-storage
+      dockerfile: Dockerfile
+      context: .
