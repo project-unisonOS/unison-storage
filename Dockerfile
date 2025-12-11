@@ -1,5 +1,5 @@
 FROM ghcr.io/project-unisonos/unison-common-wheel:latest AS common_wheel
-FROM python:3.12-slim@sha256:fdab368dc2e04fab3180d04508b41732756cc442586f708021560ee1341f3d29
+FROM python:3.14-slim@sha256:fd2aff39e5a3ed23098108786a9966fb036fdeeedd487d5360e466bb2a84377b
 
 ARG REPO_PATH="unison-storage"
 WORKDIR /app
