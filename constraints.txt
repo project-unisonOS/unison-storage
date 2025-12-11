@@ -9,4 +9,4 @@ opentelemetry-semantic-conventions==0.42b0
 opentelemetry-instrumentation==0.42b0
 protobuf==4.25.3
 grpcio==1.62.2
-googleapis-common-protos==1.59.0
+googleapis-common-protos==1.72.0
