@@ -16,5 +16,5 @@ jobs:
     with:
       image_name: unison-storage
       domain: storage
-      service_port: "8080"
+      service_port: "8082"
     secrets: inherit
