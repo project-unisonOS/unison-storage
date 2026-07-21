@@ -11,6 +11,8 @@ from typing import Any, Optional
 from unison_common.logging import configure_logging, log_json
 from unison_common.tracing_middleware import TracingMiddleware
 from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
+from unison_common.principal_middleware import PrincipalBindingMiddleware, get_bound_principal
+from unison_common.trust import LocalDevelopmentKeyBroker
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 import base64
@@ -30,6 +32,11 @@ app = FastAPI(title="unison-storage")
 app.add_middleware(TracingMiddleware, service_name="unison-storage")
 if BatonMiddleware:
     app.add_middleware(BatonMiddleware)
+app.add_middleware(
+    PrincipalBindingMiddleware,
+    service_name="storage",
+    allow_test_bypass=True,
+)
 
 logger = configure_logging("unison-storage")
 
@@ -44,6 +51,7 @@ _start_time = time.time()
 SETTINGS = StorageServiceSettings.from_env()
 _ENGINE: Engine | None = None
 _FERNET: Optional[Fernet] = None
+_OBJECT_KEY_BROKER: Optional[LocalDevelopmentKeyBroker] = None
 
 
 @app.get("/healthz")
@@ -183,14 +191,26 @@ def _get_fernet() -> Optional[Fernet]:
     return _FERNET
 
 
+def _get_object_key_broker() -> Optional[LocalDevelopmentKeyBroker]:
+    global _OBJECT_KEY_BROKER
+    if _OBJECT_KEY_BROKER is not None:
+        return _OBJECT_KEY_BROKER
+    if SETTINGS.object_enc_key:
+        try:
+            root = base64.urlsafe_b64decode(SETTINGS.object_enc_key.encode())
+            _OBJECT_KEY_BROKER = LocalDevelopmentKeyBroker(root)
+        except Exception:
+            _OBJECT_KEY_BROKER = None
+    return _OBJECT_KEY_BROKER
+
+
 def _check_auth(request: Request):
-    token = SETTINGS.service_token
-    if not token:
-        return
-    auth = request.headers.get("Authorization", "")
-    supplied = auth.replace("Bearer ", "").strip()
-    if supplied != token:
-        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        return get_bound_principal(request)
+    except RuntimeError:
+        if os.getenv("UNISON_PRINCIPAL_BINDING_TEST_BYPASS", "false").lower() == "true":
+            return None
+        raise HTTPException(status_code=401, detail="trusted principal required")
 
 
 @app.put("/kv/{namespace}/{key}")
@@ -199,6 +219,8 @@ def kv_put(namespace: str, key: str, request: Request, body: dict = Body(...)):
     event_id = request.headers.get("X-Event-ID")
     if not namespace or not key:
         return {"ok": False, "error": "invalid-path", "event_id": event_id}
+    principal = get_bound_principal(request) if not os.getenv("UNISON_PRINCIPAL_BINDING_TEST_BYPASS", "false").lower() == "true" else None
+    storage_namespace = f"{principal.data_namespace}:{namespace}" if principal else namespace
     val: Any = body.get("value") if isinstance(body, dict) else None
     try:
         encoded = json.dumps(val, separators=(",", ":"))
@@ -211,7 +233,7 @@ def kv_put(namespace: str, key: str, request: Request, body: dict = Body(...)):
                     ON CONFLICT(ns,key) DO UPDATE SET value=excluded.value
                     """
                 ),
-                {"ns": namespace, "key": key, "val": encoded},
+                {"ns": storage_namespace, "key": key, "val": encoded},
             )
         log_json(logging.INFO, "kv_put", service="unison-storage", event_id=event_id, ns=namespace, key=key)
         return {"ok": True, "event_id": event_id}
@@ -225,10 +247,12 @@ def kv_get(namespace: str, key: str, request: Request):
     _metrics["/kv/{namespace}/{key}"] += 1
     event_id = request.headers.get("X-Event-ID")
     try:
+        principal = get_bound_principal(request) if not os.getenv("UNISON_PRINCIPAL_BINDING_TEST_BYPASS", "false").lower() == "true" else None
+        storage_namespace = f"{principal.data_namespace}:{namespace}" if principal else namespace
         engine = _init_engine()
         with engine.begin() as conn:
             row = conn.execute(
-                text("SELECT value FROM kv WHERE ns=:ns AND key=:key"), {"ns": namespace, "key": key}
+                text("SELECT value FROM kv WHERE ns=:ns AND key=:key"), {"ns": storage_namespace, "key": key}
             ).fetchone()
         value = json.loads(row[0]) if row and row[0] is not None else None
         log_json(logging.INFO, "kv_get", service="unison-storage", event_id=event_id, ns=namespace, key=key, hit=value is not None)
@@ -245,7 +269,9 @@ def memory_put(request: Request, body: dict = Body(...), _: None = Depends(_chec
     _metrics["/memory"] += 1
     session_id = body.get("session_id")
     payload = body.get("data")
-    person_id = body.get("person_id")
+    principal = get_bound_principal(request) if _ is not None else None
+    person_id = principal.person_id if principal else body.get("person_id")
+    stored_session_id = f"{principal.data_namespace}:{session_id}" if principal else session_id
     ttl = body.get("ttl") or body.get("ttl_seconds")
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id required")
@@ -265,7 +291,7 @@ def memory_put(request: Request, body: dict = Body(...), _: None = Depends(_chec
                 """
             ),
             {
-                "sid": session_id,
+                "sid": stored_session_id,
                 "pid": person_id,
                 "payload": json.dumps(payload),
                 "ttl": ttl,
@@ -276,7 +302,8 @@ def memory_put(request: Request, body: dict = Body(...), _: None = Depends(_chec
 
 
 @app.get("/memory/{session_id}")
-def memory_get(session_id: str, _: None = Depends(_check_auth)):
+def memory_get(session_id: str, request: Request, principal=Depends(_check_auth)):
+    stored_session_id = f"{principal.data_namespace}:{session_id}" if principal else session_id
     engine = _init_engine()
     with engine.begin() as conn:
         row = conn.execute(
@@ -286,7 +313,7 @@ def memory_get(session_id: str, _: None = Depends(_check_auth)):
                 WHERE session_id=:sid
                 """
             ),
-            {"sid": session_id},
+            {"sid": stored_session_id},
         ).fetchone()
     if not row:
         return {"ok": False, "error": "not-found"}
@@ -299,17 +326,19 @@ def memory_get(session_id: str, _: None = Depends(_check_auth)):
 
 
 @app.delete("/memory/{session_id}")
-def memory_delete(session_id: str, _: None = Depends(_check_auth)):
+def memory_delete(session_id: str, request: Request, principal=Depends(_check_auth)):
+    stored_session_id = f"{principal.data_namespace}:{session_id}" if principal else session_id
     engine = _init_engine()
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM memory_entries WHERE session_id=:sid"), {"sid": session_id})
+        conn.execute(text("DELETE FROM memory_entries WHERE session_id=:sid"), {"sid": stored_session_id})
     return {"ok": True}
 
 
 # --- Vault ---
 @app.post("/vault")
-def vault_put(body: dict = Body(...), _: None = Depends(_check_auth)):
+def vault_put(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
     key_id = body.get("key_id") or body.get("id") or str(uuid.uuid4())
+    stored_key_id = f"{principal.credential_namespace}:{key_id}" if principal else key_id
     cipher_text = body.get("cipher_text") or body.get("data")
     metadata = body.get("metadata") or {}
     if not cipher_text or not isinstance(cipher_text, str):
@@ -328,18 +357,19 @@ def vault_put(body: dict = Body(...), _: None = Depends(_check_auth)):
                     version=vault_entries.version + 1
                 """
             ),
-            {"key_id": key_id, "cipher_text": cipher_text, "metadata": json.dumps(metadata)},
+            {"key_id": stored_key_id, "cipher_text": cipher_text, "metadata": json.dumps(metadata)},
         )
     return {"ok": True, "key_id": key_id}
 
 
 @app.get("/vault/{key_id}")
-def vault_get(key_id: str, _: None = Depends(_check_auth)):
+def vault_get(key_id: str, request: Request, principal=Depends(_check_auth)):
+    stored_key_id = f"{principal.credential_namespace}:{key_id}" if principal else key_id
     engine = _init_engine()
     with engine.begin() as conn:
         row = conn.execute(
             text("SELECT cipher_text, metadata, version, updated_at FROM vault_entries WHERE key_id=:key_id"),
-            {"key_id": key_id},
+            {"key_id": stored_key_id},
         ).fetchone()
     if not row:
         return {"ok": False, "error": "not-found"}
@@ -356,7 +386,7 @@ def vault_get(key_id: str, _: None = Depends(_check_auth)):
 
 # --- Audit ---
 @app.post("/audit")
-def audit_log(body: dict = Body(...), _: None = Depends(_check_auth)):
+def audit_log(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
     event_id = body.get("id") or str(uuid.uuid4())
     actor = body.get("actor")
     action = body.get("action")
@@ -374,8 +404,8 @@ def audit_log(body: dict = Body(...), _: None = Depends(_check_auth)):
             ),
             {
                 "id": event_id,
-                "person_id": body.get("person_id"),
-                "actor": actor,
+                "person_id": principal.person_id if principal else body.get("person_id"),
+                "actor": principal.principal_id if principal else actor,
                 "action": action,
                 "target": body.get("target"),
                 "decision_id": body.get("decision_id"),
@@ -399,7 +429,9 @@ def object_put(body: dict = Body(...), request: Request = None, _: None = Depend
     obj_id = body.get("id") or str(uuid.uuid4())
     content_b64 = body.get("content_b64")
     content_type = body.get("content_type") or "application/octet-stream"
-    person_id = body.get("person_id")
+    principal = get_bound_principal(request) if _ is not None else None
+    person_id = principal.person_id if principal else body.get("person_id")
+    stored_obj_id = f"{principal.data_namespace}:{obj_id}" if principal else obj_id
     backend = "filesystem"
     checksum = None
     size_bytes: Optional[int] = None
@@ -410,10 +442,20 @@ def object_put(body: dict = Body(...), request: Request = None, _: None = Depend
         except Exception:
             raise HTTPException(status_code=400, detail="invalid base64 content")
         checksum = hashlib.sha256(data).hexdigest()
-        fernet = _get_fernet()
-        if fernet:
-            data = fernet.encrypt(data)
-        target = _objects_dir() / obj_id
+        broker = _get_object_key_broker()
+        if principal and broker and principal.key_handle:
+            data = broker.encrypt(
+                key_handle=principal.key_handle,
+                plaintext=data,
+                associated_data=f"unison-storage:object:{obj_id}".encode(),
+            )
+        elif principal and os.getenv("ENVIRONMENT") == "prod":
+            raise HTTPException(status_code=503, detail="principal key broker unavailable")
+        else:
+            fernet = _get_fernet()
+            if fernet:
+                data = fernet.encrypt(data)
+        target = _objects_dir() / hashlib.sha256(stored_obj_id.encode()).hexdigest()
         target.write_bytes(data)
         path = str(target)
         size_bytes = len(data)
@@ -435,7 +477,7 @@ def object_put(body: dict = Body(...), request: Request = None, _: None = Depend
                 """
             ),
             {
-                "id": obj_id,
+                "id": stored_obj_id,
                 "person_id": person_id,
                 "content_type": content_type,
                 "size_bytes": size_bytes,
@@ -448,7 +490,8 @@ def object_put(body: dict = Body(...), request: Request = None, _: None = Depend
 
 
 @app.get("/objects/{obj_id}")
-def object_get(obj_id: str, _: None = Depends(_check_auth)):
+def object_get(obj_id: str, request: Request, principal=Depends(_check_auth)):
+    stored_obj_id = f"{principal.data_namespace}:{obj_id}" if principal else obj_id
     engine = _init_engine()
     with engine.begin() as conn:
         row = conn.execute(
@@ -458,7 +501,7 @@ def object_get(obj_id: str, _: None = Depends(_check_auth)):
                 FROM objects WHERE id=:id
                 """
             ),
-            {"id": obj_id},
+            {"id": stored_obj_id},
         ).fetchone()
     if not row:
         return {"ok": False, "error": "not-found"}
@@ -466,8 +509,19 @@ def object_get(obj_id: str, _: None = Depends(_check_auth)):
     content_b64 = None
     if path and Path(path).exists():
         data = Path(path).read_bytes()
-        fernet = _get_fernet()
-        if fernet:
+        broker = _get_object_key_broker()
+        if principal and broker and principal.key_handle:
+            try:
+                data = broker.decrypt(
+                    key_handle=principal.key_handle,
+                    ciphertext=data,
+                    associated_data=f"unison-storage:object:{obj_id}".encode(),
+                )
+            except Exception:
+                raise HTTPException(status_code=404, detail="object not found")
+        else:
+            fernet = _get_fernet()
+        if not principal and fernet:
             try:
                 data = fernet.decrypt(data)
             except Exception:
