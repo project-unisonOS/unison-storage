@@ -19,7 +19,7 @@ import base64
 import os
 import uuid
 import hashlib
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 try:
     from unison_common import BatonMiddleware
 except Exception:
@@ -524,7 +524,7 @@ def object_get(obj_id: str, request: Request, principal=Depends(_check_auth)):
         if not principal and fernet:
             try:
                 data = fernet.decrypt(data)
-            except Exception:
+            except InvalidToken:
                 pass
         content_b64 = base64.b64encode(data).decode()
     return {
@@ -539,4 +539,5 @@ def object_get(obj_id: str, request: Request, principal=Depends(_check_auth)):
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8082)
+    # The container runtime publishes this internal service port intentionally.
+    uvicorn.run(app, host="0.0.0.0", port=8082)  # nosec B104
