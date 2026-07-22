@@ -7,14 +7,14 @@ on:
 
 jobs:
   python-security:
-    uses: project-unisonOS/.github/.github/workflows/reusable-python-security.yml@45118ffb52ee397cf7a510767154ee5b3705a850
+    uses: project-unisonOS/.github/.github/workflows/reusable-python-security.yml@7b392529550f2963dc0022428e873ddb17cdedd4
     with:
       python-version: "3.12"
       working-directory: "."
       unison-common-ref: "eef1a7353b2c795233daf0db6079b867ff2d98ba"
 
   container-supply-chain:
-    uses: project-unisonOS/.github/.github/workflows/reusable-container-supply-chain.yml@45118ffb52ee397cf7a510767154ee5b3705a850
+    uses: project-unisonOS/.github/.github/workflows/reusable-container-supply-chain.yml@7b392529550f2963dc0022428e873ddb17cdedd4
     with:
       image-name: unison-storage
       dockerfile: Dockerfile
