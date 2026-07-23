@@ -1,5 +1,17 @@
 # unison-storage
 
+## Phase 6 provider-blind backup
+
+`src.backup_service` implements independent person/shared-space snapshots,
+signed incremental lineage, trusted checkpoints, scheduled verification,
+retention, encrypted export, cryptographic deletion, provider migration,
+resumable dry-run-first restore, and post-restore key/device rotation.
+
+`src.backup_backends` provides atomic filesystem, deterministic hostile, and
+S3-compatible backends. Backends receive opaque identifiers and ciphertext
+only. Backup is intentionally separate from synchronization and remote access;
+the home node remains authoritative.
+
 Key/value, memory, vault, object, and audit storage service for UnisonOS.
 
 ## Status
