@@ -16,6 +16,7 @@ class StorageServiceSettings:
     database_url: str = ""
     service_token: str = ""
     object_enc_key: str = ""
+    life_operations_root: Path = Path("/data/life-operations")
 
     @classmethod
     def from_env(cls) -> "StorageServiceSettings":
@@ -24,6 +25,7 @@ class StorageServiceSettings:
             database_url=os.getenv("STORAGE_DATABASE_URL", ""),
             service_token=os.getenv("STORAGE_SERVICE_TOKEN", ""),
             object_enc_key=read_secret_setting("STORAGE_OBJECT_ENC_KEY"),
+            life_operations_root=Path(os.getenv("UNISON_LIFE_OPERATIONS_ROOT", "/data/life-operations")),
         )
 
 

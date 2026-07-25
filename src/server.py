@@ -5,7 +5,6 @@ import uvicorn
 import logging
 import json
 import time
-import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 from unison_common.logging import configure_logging, log_json
@@ -20,6 +19,7 @@ import os
 import uuid
 import hashlib
 from cryptography.fernet import Fernet, InvalidToken
+from life_operations import ConnectionBroker, ConnectionRejected, IntakeRejected, SourceLibrary
 try:
     from unison_common import BatonMiddleware
 except Exception:
@@ -52,6 +52,8 @@ SETTINGS = StorageServiceSettings.from_env()
 _ENGINE: Engine | None = None
 _FERNET: Optional[Fernet] = None
 _OBJECT_KEY_BROKER: Optional[LocalDevelopmentKeyBroker] = None
+_SOURCE_LIBRARY: SourceLibrary | None = None
+_CONNECTION_BROKER = ConnectionBroker()
 
 
 @app.get("/healthz")
@@ -202,6 +204,30 @@ def _get_object_key_broker() -> Optional[LocalDevelopmentKeyBroker]:
         except Exception:
             _OBJECT_KEY_BROKER = None
     return _OBJECT_KEY_BROKER
+
+
+def _source_library() -> SourceLibrary:
+    global _SOURCE_LIBRARY
+    if _SOURCE_LIBRARY is None:
+        key_value = SETTINGS.object_enc_key
+        if not key_value:
+            if os.getenv("ENVIRONMENT") == "prod":
+                raise HTTPException(status_code=503, detail="life operations encryption key unavailable")
+            key_path = SETTINGS.life_operations_root / ".development-key"
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            if not key_path.exists():
+                key_path.write_bytes(Fernet.generate_key())
+                key_path.chmod(0o600)
+            key_value = key_path.read_text(encoding="ascii").strip()
+        _SOURCE_LIBRARY = SourceLibrary(SETTINGS.life_operations_root, key_value.encode())
+    return _SOURCE_LIBRARY
+
+
+def _life_person(request: Request, principal: Any, supplied: str | None = None) -> str:
+    person_id = principal.person_id if principal else supplied
+    if not person_id:
+        raise HTTPException(status_code=400, detail="person_id required")
+    return person_id
 
 
 def _check_auth(request: Request):
@@ -537,6 +563,132 @@ def object_get(obj_id: str, request: Request, principal=Depends(_check_auth)):
         "checksum": checksum,
         "content_b64": content_b64,
     }
+
+# --- Private life operations intake and connection broker ---
+@app.post("/v1/imports")
+def import_start(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    person_id = _life_person(request, principal, body.get("person_id"))
+    try:
+        return _source_library().start(person_id, body.get("space_id") or f"private:{person_id}", body.get("channel", "file"))
+    except IntakeRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/imports/{session_id}/sources")
+def import_source(session_id: str, request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    person_id = _life_person(request, principal, body.get("person_id"))
+    try:
+        content = base64.b64decode(body.get("content_b64", ""), validate=True)
+        return _source_library().ingest(
+            session_id, body.get("filename", ""), body.get("media_type", ""), content, person_id
+        )
+    except (IntakeRejected, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/imports/{session_id}/admit")
+def import_admit(session_id: str, request: Request, body: dict = Body(default={}), principal=Depends(_check_auth)):
+    try:
+        return _source_library().admit(_life_person(request, principal, body.get("person_id")), session_id)
+    except IntakeRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/v1/imports/{session_id}")
+def import_rollback(session_id: str, request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    try:
+        _source_library().rollback(_life_person(request, principal, person_id), session_id)
+        return {"ok": True}
+    except IntakeRejected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/v1/sources")
+def sources_list(request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    return {"sources": _source_library().list_sources(_life_person(request, principal, person_id))}
+
+
+@app.patch("/v1/sources/{source_id}/fields/{field_id}")
+def source_correct(source_id: str, field_id: str, request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _source_library().correct_field(
+            _life_person(request, principal, body.get("person_id")), source_id, field_id, body.get("value")
+        )
+    except IntakeRejected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/v1/sources/{source_id}")
+def source_delete(source_id: str, request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    try:
+        _source_library().delete_source(_life_person(request, principal, person_id), source_id)
+        return {"ok": True, "deleted": source_id}
+    except IntakeRejected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/v1/connections/catalog")
+def connection_catalog(request: Request, principal=Depends(_check_auth)):
+    return {"providers": _CONNECTION_BROKER.catalog()}
+
+
+@app.post("/v1/connections/oauth/start")
+def connection_oauth_start(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _CONNECTION_BROKER.begin_oauth(
+            _life_person(request, principal, body.get("person_id")), body.get("provider_id", ""), body.get("redirect_uri", "")
+        )
+    except ConnectionRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/connections/oauth/complete")
+def connection_oauth_complete(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _CONNECTION_BROKER.complete_oauth(
+            _life_person(request, principal, body.get("person_id")), body.get("state", ""), body.get("authorization_code", "")
+        )
+    except ConnectionRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/connections/local")
+def connection_local(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _CONNECTION_BROKER.register_local(
+            _life_person(request, principal, body.get("person_id")), body.get("provider_id", ""),
+            body.get("grant_handle", ""), body.get("watch", False)
+        )
+    except ConnectionRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/connections")
+def connections_list(request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    return {"connections": _CONNECTION_BROKER.list_connections(_life_person(request, principal, person_id))}
+
+
+@app.post("/v1/connections/{connection_id}/sync")
+def connection_sync(connection_id: str, request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _CONNECTION_BROKER.sync(
+            _life_person(request, principal, body.get("person_id")), connection_id,
+            body.get("item_ids", []), body.get("next_cursor")
+        )
+    except ConnectionRejected as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/v1/connections/{connection_id}")
+def connection_disconnect(connection_id: str, request: Request, person_id: str | None = None,
+                          delete_imported: bool = False, principal=Depends(_check_auth)):
+    try:
+        return _CONNECTION_BROKER.disconnect(
+            _life_person(request, principal, person_id), connection_id, delete_imported
+        )
+    except ConnectionRejected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
 
 if __name__ == "__main__":
     # The container runtime publishes this internal service port intentionally.
