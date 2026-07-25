@@ -3,7 +3,7 @@ from datetime import date, timedelta
 import pytest
 from cryptography.fernet import Fernet
 
-from domain_operations import DomainRejected, LifeDomainStore
+from src.domain_operations import DomainRejected, LifeDomainStore
 
 
 def store(tmp_path):
