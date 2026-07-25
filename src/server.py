@@ -20,6 +20,7 @@ import uuid
 import hashlib
 from cryptography.fernet import Fernet, InvalidToken
 from life_operations import ConnectionBroker, ConnectionRejected, IntakeRejected, SourceLibrary
+from domain_operations import DomainRejected, LifeDomainStore
 try:
     from unison_common import BatonMiddleware
 except Exception:
@@ -54,6 +55,7 @@ _FERNET: Optional[Fernet] = None
 _OBJECT_KEY_BROKER: Optional[LocalDevelopmentKeyBroker] = None
 _SOURCE_LIBRARY: SourceLibrary | None = None
 _CONNECTION_BROKER = ConnectionBroker()
+_DOMAIN_STORE: LifeDomainStore | None = None
 
 
 @app.get("/healthz")
@@ -221,6 +223,27 @@ def _source_library() -> SourceLibrary:
             key_value = key_path.read_text(encoding="ascii").strip()
         _SOURCE_LIBRARY = SourceLibrary(SETTINGS.life_operations_root, key_value.encode())
     return _SOURCE_LIBRARY
+
+
+def _life_key() -> bytes:
+    key_value = SETTINGS.object_enc_key
+    if key_value:
+        return key_value.encode()
+    if os.getenv("ENVIRONMENT") == "prod":
+        raise HTTPException(status_code=503, detail="life operations encryption key unavailable")
+    key_path = SETTINGS.life_operations_root / ".development-key"
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if not key_path.exists():
+        key_path.write_bytes(Fernet.generate_key())
+        key_path.chmod(0o600)
+    return key_path.read_text(encoding="ascii").strip().encode()
+
+
+def _domain_store() -> LifeDomainStore:
+    global _DOMAIN_STORE
+    if _DOMAIN_STORE is None:
+        _DOMAIN_STORE = LifeDomainStore(SETTINGS.life_domains_root, _life_key())
+    return _DOMAIN_STORE
 
 
 def _life_person(request: Request, principal: Any, supplied: str | None = None) -> str:
@@ -621,8 +644,10 @@ def source_correct(source_id: str, field_id: str, request: Request, body: dict =
 @app.delete("/v1/sources/{source_id}")
 def source_delete(source_id: str, request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
     try:
-        _source_library().delete_source(_life_person(request, principal, person_id), source_id)
-        return {"ok": True, "deleted": source_id}
+        bound_person = _life_person(request, principal, person_id)
+        _source_library().delete_source(bound_person, source_id)
+        cascade = _domain_store().delete_records_from_source(bound_person, source_id)
+        return {"ok": True, "deleted": source_id, "derived_cascade": cascade}
     except IntakeRejected as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -688,6 +713,221 @@ def connection_disconnect(connection_id: str, request: Request, person_id: str |
         )
     except ConnectionRejected as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# --- Household, health, finance, and cross-domain packages ---
+@app.post("/v1/domain/records")
+def domain_record_create(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        person_id = _life_person(request, principal, body.get("person_id"))
+        domain = body.get("domain", "")
+        default_space = f"{domain}:{person_id}" if domain in {"health", "finance"} else f"private:{person_id}"
+        return _domain_store().create_record(
+            person_id, body.get("space_id") or default_space, domain, body.get("record_type", ""),
+            body.get("facts", {}), body.get("source_ids", []), body.get("evidence_status", "observed"),
+            float(body.get("confidence", 1.0)),
+        )
+    except (DomainRejected, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/domain/records")
+def domain_records(request: Request, domain: str | None = None, person_id: str | None = None,
+                   principal=Depends(_check_auth)):
+    return {"records": _domain_store().records(_life_person(request, principal, person_id), domain)}
+
+
+@app.post("/v1/domain/records/{record_id}/share")
+def domain_record_share(record_id: str, request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().share_record(_life_person(request, principal, body.get("person_id")), record_id,
+                                            body.get("target_space", ""), body.get("confirmed") is True)
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/household/reconcile-product")
+def household_reconcile(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().reconcile_product(_life_person(request, principal, body.get("person_id")),
+                                                 body.get("label_record_id", ""), body.get("receipt_record_id", ""))
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/household/attention")
+def household_attention(request: Request, body: dict = Body(default={}), principal=Depends(_check_auth)):
+    return {"items": _domain_store().household_attention(
+        _life_person(request, principal, body.get("person_id")), body.get("recall_feed", []))}
+
+
+@app.post("/v1/domain/household/repair-brief")
+def household_repair_brief(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().repair_brief(_life_person(request, principal, body.get("person_id")),
+                                            body.get("record_ids", []))
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/household/procedure-brief")
+def household_procedure_brief(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().procedure_brief(_life_person(request, principal, body.get("person_id")),
+                                               body.get("record_id", ""))
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/health/fhir")
+def health_fhir(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    return {"records": _domain_store().normalize_fhir(
+        _life_person(request, principal, body.get("person_id")), body.get("source_id", ""), body.get("resources", []))}
+
+
+@app.post("/v1/domain/health/safety")
+def health_safety(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    return {"outcome": _domain_store().health_safety(
+        _life_person(request, principal, body.get("person_id")), body.get("text", ""), body.get("source_ids", []))}
+
+
+@app.get("/v1/domain/health/timeline")
+def health_timeline(request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    return {"records": _domain_store().health_timeline(_life_person(request, principal, person_id))}
+
+
+@app.get("/v1/domain/health/contradictions")
+def health_contradictions(request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    return {"contradictions": _domain_store().reconcile_health(_life_person(request, principal, person_id))}
+
+
+@app.post("/v1/domain/health/visit-brief")
+def health_visit_brief(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().visit_brief(_life_person(request, principal, body.get("person_id")),
+                                           body.get("record_ids", []))
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/health/trend")
+def health_trend(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().health_trend(_life_person(request, principal, body.get("person_id")),
+                                            body.get("record_ids", []), body.get("value_field", "value"),
+                                            body.get("threshold"))
+    except (DomainRejected, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/health/emergency-summary")
+def health_emergency_summary(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().emergency_card(_life_person(request, principal, body.get("person_id")),
+                                              body.get("record_ids", []), body.get("confirmed") is True)
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/finance/reconcile")
+def finance_reconcile(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().finance_reconcile(
+            _life_person(request, principal, body.get("person_id")), float(body.get("statement_total", 0)),
+            body.get("transaction_record_ids", []), float(body.get("tolerance", 0.01)))
+    except (DomainRejected, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/domain/finance/attention")
+def finance_attention(request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    return {"items": _domain_store().finance_attention(_life_person(request, principal, person_id))}
+
+
+@app.get("/v1/domain/finance/forecast")
+def finance_forecast(request: Request, horizon_days: int = 30, person_id: str | None = None,
+                     principal=Depends(_check_auth)):
+    return _domain_store().cash_flow_forecast(_life_person(request, principal, person_id), horizon_days)
+
+
+@app.post("/v1/domain/finance/household-view")
+def finance_household_view(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().household_finance_view(_life_person(request, principal, body.get("person_id")),
+                                                      body.get("record_ids", []))
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/domain/finance/weekly-brief")
+def finance_weekly_brief(request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    return _domain_store().weekly_finance_brief(_life_person(request, principal, person_id))
+
+
+@app.post("/v1/domain/drafts")
+def domain_draft(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().draft(_life_person(request, principal, body.get("person_id")),
+                                     body.get("action_type", ""), body.get("record_ids", []),
+                                     body.get("recipients", []), body.get("disclosed_fields", []), body.get("content", ""))
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/links")
+def domain_link(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().link(_life_person(request, principal, body.get("person_id")),
+                                    body.get("left_record_id", ""), body.get("right_record_id", ""),
+                                    body.get("purpose", ""), body.get("allowed_fields", []),
+                                    body.get("recipients", []), body.get("approved") is True)
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/v1/domain/links/{link_id}")
+def domain_unlink(link_id: str, request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
+    try:
+        _domain_store().unlink(_life_person(request, principal, person_id), link_id)
+        return {"ok": True}
+    except DomainRejected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/v1/domain/transitions/{transition}")
+def domain_transition(transition: str, request: Request, principal=Depends(_check_auth)):
+    _life_person(request, principal)
+    try:
+        return _domain_store().transition_template(transition)
+    except DomainRejected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/packets")
+def domain_packet(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        return _domain_store().cross_domain_packet(_life_person(request, principal, body.get("person_id")),
+                                                   body.get("link_ids", []), body.get("packet_type", ""),
+                                                   body.get("recipients", []))
+    except DomainRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/domain/attention")
+def domain_attention(request: Request, body: dict = Body(default={}), principal=Depends(_check_auth)):
+    return {"items": _domain_store().attention_inbox(
+        _life_person(request, principal, body.get("person_id")), body.get("goals", []))}
+
+
+@app.post("/v1/domain/pilots")
+def domain_pilot(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    _life_person(request, principal, body.get("person_id"))
+    try:
+        return _domain_store().pilot_report(body.get("cohort", ""), body.get("opted_in") is True,
+                                            body.get("measurements", {}), int(body.get("boundary_incidents", 0)),
+                                            int(body.get("unsafe_actions", 0)))
+    except (DomainRejected, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 if __name__ == "__main__":
