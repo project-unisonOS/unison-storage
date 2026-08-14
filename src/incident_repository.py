@@ -166,3 +166,35 @@ class IncidentRepository:
         self.get(person_id, space_id, incident_id, authorized_space_ids)
         return [{"handle_id": key, **value} for key, value in self._read()["media"].items()
                 if value["incident_id"] == incident_id]
+
+    def observations(self, person_id: str, space_id: str, incident_id: str,
+                     authorized_space_ids: Iterable[str]) -> list[dict[str, Any]]:
+        self.get(person_id, space_id, incident_id, authorized_space_ids)
+        return [value["observation"] for value in self._read()["observations"].values()
+                if value["incident_id"] == incident_id]
+
+    def update_assignment(self, person_id: str, space_id: str, incident_id: str,
+                          assignment_id: str, assignment_state: str, at: datetime,
+                          authorized_space_ids: Iterable[str],
+                          household_member_ids: Iterable[str]) -> HouseholdIncident:
+        incident = self.get(person_id, space_id, incident_id, authorized_space_ids)
+        if assignment_state not in {"acknowledged", "completed", "cancelled"}:
+            raise IncidentRejected("assignment state is invalid")
+        updated = []
+        found = False
+        for assignment in incident.assignments:
+            if assignment.assignment_id != assignment_id:
+                updated.append(assignment)
+                continue
+            found = True
+            if assignment.assignee_person_id not in set(household_member_ids):
+                raise IncidentRejected("incident unavailable")
+            values = {"state": assignment_state}
+            if assignment_state in {"acknowledged", "completed"}:
+                values["acknowledged_at"] = assignment.acknowledged_at or at
+            if assignment_state == "completed":
+                values["completed_at"] = at
+            updated.append(assignment.model_copy(update=values))
+        if not found:
+            raise IncidentRejected("incident unavailable")
+        return self.replace(person_id, incident.model_copy(update={"assignments": updated}), authorized_space_ids)

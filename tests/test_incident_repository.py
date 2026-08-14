@@ -101,3 +101,19 @@ def test_only_selected_opaque_media_handles_are_retained_and_ephemeral_media_is_
                                              event("e2", IncidentState.CLOSED, 1)])
     store.replace("alice", closed, [SPACE])
     assert store.media_handles("alice", SPACE, "inc-1", [SPACE]) == []
+
+
+def test_assignment_acknowledgement_and_cancellation_are_restart_safe(tmp_path):
+    key = Fernet.generate_key()
+    store = repository(tmp_path, key)
+    store.create("alice", incident(), [SPACE])
+    assignment = IncidentAssignment(assignment_id="a1", incident_id="inc-1", workflow_step_id="inspect",
+                                    assignee_person_id="bob", action="Inspect", created_at=NOW,
+                                    source_ids=["procedure-1"])
+    store.assign("alice", SPACE, assignment, [SPACE], ["alice", "bob"])
+    acknowledged = store.update_assignment("bob", SPACE, "inc-1", "a1", "acknowledged",
+                                           NOW + timedelta(minutes=1), [SPACE], ["alice", "bob"])
+    assert acknowledged.assignments[0].acknowledged_at is not None
+    cancelled = repository(tmp_path, key).update_assignment(
+        "bob", SPACE, "inc-1", "a1", "cancelled", NOW + timedelta(minutes=2), [SPACE], ["alice", "bob"])
+    assert cancelled.assignments[0].state == "cancelled"
