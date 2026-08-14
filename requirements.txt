@@ -9,7 +9,6 @@ boto3==1.42.70
 bleach==6.4.0
 PyJWT[crypto]==2.13.0
 redis==8.0.1
-unison-common @ git+https://github.com/project-unisonOS/unison-common.git@8ef6b99
 opentelemetry-api==1.44.0
 opentelemetry-sdk==1.44.0
 opentelemetry-exporter-otlp==1.44.0
