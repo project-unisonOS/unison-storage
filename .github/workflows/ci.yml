@@ -11,7 +11,7 @@ jobs:
     with:
       python-version: "3.12"
       working-directory: "."
-      unison-common-ref: "8b82c2fe26b31aa4b368eb150654e0dd3561fa58"
+      unison-common-ref: "8ef6b9971900ebfe105ca4e9cd5909f76428bb9d"
 
   container-supply-chain:
     uses: project-unisonOS/.github/.github/workflows/reusable-container-supply-chain.yml@7b392529550f2963dc0022428e873ddb17cdedd4
