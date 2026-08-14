@@ -18,9 +18,12 @@ import base64
 import os
 import uuid
 import hashlib
+from datetime import datetime
 from cryptography.fernet import Fernet, InvalidToken
 from life_operations import ConnectionBroker, ConnectionRejected, IntakeRejected, SourceLibrary
 from domain_operations import DomainRejected, LifeDomainStore
+from incident_repository import IncidentRejected, IncidentRepository
+from unison_common.contracts.v1.shared_incident import HouseholdIncident, SensorObservation
 try:
     from unison_common import BatonMiddleware
 except Exception:
@@ -56,6 +59,7 @@ _OBJECT_KEY_BROKER: Optional[LocalDevelopmentKeyBroker] = None
 _SOURCE_LIBRARY: SourceLibrary | None = None
 _CONNECTION_BROKER = ConnectionBroker()
 _DOMAIN_STORE: LifeDomainStore | None = None
+_INCIDENT_REPOSITORY: IncidentRepository | None = None
 
 
 @app.get("/healthz")
@@ -244,6 +248,26 @@ def _domain_store() -> LifeDomainStore:
     if _DOMAIN_STORE is None:
         _DOMAIN_STORE = LifeDomainStore(SETTINGS.life_domains_root, _life_key())
     return _DOMAIN_STORE
+
+
+def _incident_repository() -> IncidentRepository:
+    global _INCIDENT_REPOSITORY
+    if _INCIDENT_REPOSITORY is None:
+        _INCIDENT_REPOSITORY = IncidentRepository(SETTINGS.incidents_root, _life_key())
+    return _INCIDENT_REPOSITORY
+
+
+def _incident_authority(principal: Any, body: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+    if principal:
+        if not principal.person_id or not principal.household_id or not principal.membership_id:
+            raise HTTPException(status_code=403, detail="active household membership required")
+        return principal.person_id, [f"shared:{principal.household_id}"], [principal.person_id]
+    person_id = body.get("person_id")
+    spaces = body.get("authorized_space_ids") or []
+    members = body.get("household_member_ids") or ([person_id] if person_id else [])
+    if not person_id or not spaces:
+        raise HTTPException(status_code=400, detail="test principal authority required")
+    return person_id, spaces, members
 
 
 def _life_person(request: Request, principal: Any, supplied: str | None = None) -> str:
@@ -928,6 +952,46 @@ def domain_pilot(request: Request, body: dict = Body(...), principal=Depends(_ch
                                             int(body.get("unsafe_actions", 0)))
     except (DomainRejected, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --- Shared household incident authority ---
+@app.post("/v1/incidents", status_code=201)
+def incident_create(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        person_id, spaces, _ = _incident_authority(principal, body)
+        incident = HouseholdIncident.model_validate(body.get("incident"))
+        observation = SensorObservation.model_validate(body.get("observation"))
+        stored = _incident_repository().create(person_id, incident, spaces)
+        admission = _incident_repository().admit_observation(
+            person_id, incident.space_id, incident.incident_id, observation, spaces, observation.received_at)
+        return {"incident": stored.model_dump(mode="json"), "observation_status": admission["status"]}
+    except (IncidentRejected, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/incidents/{incident_id}/assignments/{assignment_id}/state")
+def incident_assignment_state(incident_id: str, assignment_id: str, request: Request,
+                              body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        person_id, spaces, members = _incident_authority(principal, body)
+        incident = _incident_repository().update_assignment(
+            person_id, body.get("space_id", ""), incident_id, assignment_id,
+            body.get("state", ""), datetime.fromisoformat(body.get("at")), spaces, members)
+        return {"incident": incident.model_dump(mode="json")}
+    except (IncidentRejected, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/v1/incidents/{incident_id}/read")
+def incident_read(incident_id: str, request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    try:
+        person_id, spaces, _ = _incident_authority(principal, body)
+        incident = _incident_repository().get(person_id, body.get("space_id", ""), incident_id, spaces)
+        observations = _incident_repository().observations(
+            person_id, incident.space_id, incident_id, spaces)
+        return {"incident": incident.model_dump(mode="json"), "observations": observations}
+    except IncidentRejected as exc:
+        raise HTTPException(status_code=404, detail="incident unavailable") from exc
 
 
 if __name__ == "__main__":
