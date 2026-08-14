@@ -18,6 +18,7 @@ class StorageServiceSettings:
     object_enc_key: str = ""
     life_operations_root: Path = Path("/data/life-operations")
     life_domains_root: Path = Path("/data/life-domains")
+    incidents_root: Path = Path("/data/incidents")
 
     @classmethod
     def from_env(cls) -> "StorageServiceSettings":
@@ -28,6 +29,7 @@ class StorageServiceSettings:
             object_enc_key=read_secret_setting("STORAGE_OBJECT_ENC_KEY"),
             life_operations_root=Path(os.getenv("UNISON_LIFE_OPERATIONS_ROOT", "/data/life-operations")),
             life_domains_root=Path(os.getenv("UNISON_LIFE_DOMAINS_ROOT", "/data/life-domains")),
+            incidents_root=Path(os.getenv("UNISON_INCIDENTS_ROOT", "/data/incidents")),
         )
 
 
