@@ -151,6 +151,73 @@ def test_deleted_source_cannot_return_orphaned_domain_record(boundary):
     assert response.status_code == 409 and "records" not in response.json()
 
 
+def test_readmission_cannot_resurrect_deleted_orphan_after_restart(boundary, monkeypatch):
+    module, client, headers, _ = boundary
+    writer = headers(scopes=(*INGEST, "storage.sources.delete"))
+    source, session = admitted(client, writer)
+    assert client.post("/v1/domain/records", headers=writer, json=record(source)).status_code == 200
+    def interrupted(*args):
+        raise RuntimeError("synthetic cascade interruption")
+    monkeypatch.setattr(module._domain_store(), "delete_records_from_source", interrupted)
+    with pytest.raises(RuntimeError, match="synthetic cascade interruption"):
+        client.delete(f"/v1/sources/{source}", headers=writer)
+    for _ in range(2):
+        module._SOURCE_LIBRARY = None
+        module._DOMAIN_STORE = None
+        assert client.post(f"/v1/imports/{session}/admit", headers=writer, json={}).status_code == 400
+        assert module._source_library()._read_index()["sources"][source]["state"] == "deleted"
+        response = client.get("/v1/domain/records?domain=health", headers=headers(scopes=["storage.health.read"]))
+        assert response.status_code == 409 and "records" not in response.json()
+        assert client.post("/v1/domain/records", headers=writer, json=record(source)).status_code == 400
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed_bytes", "corrupt_ciphertext"])
+def test_admission_rejects_missing_or_damaged_blob_persistently(boundary, damage):
+    module, client, headers, _ = boundary
+    writer = headers(scopes=INGEST)
+    source, session = admitted(client, writer, admit=False)
+    state = module._source_library()._state
+    if damage == "corrupt_ciphertext":
+        with state.transaction() as db:
+            db.execute("UPDATE blobs SET value=? WHERE id=?", (b"invalid ciphertext", source))
+    else:
+        state.delete_blob(source)
+        if damage == "changed_bytes": state.put_blob(source, b"changed synthetic content")
+    for attempt in range(2):
+        module._SOURCE_LIBRARY = None
+        assert client.post(f"/v1/imports/{session}/admit", headers=writer, json={}).status_code == 400
+        assert module._source_library()._read_index()["sessions"][session]["state"] == "rejected"
+        if attempt == 0:
+            # Even repairing the bytes cannot revive the rejected import ID.
+            repaired = module._source_library()._state
+            repaired.delete_blob(source)
+            repaired.put_blob(source, b"synthetic source")
+
+
+def test_admission_replay_valid_but_rollback_terminal(boundary):
+    module, client, headers, _ = boundary
+    writer = headers(scopes=(*INGEST, "storage.import.rollback"))
+    source, session = admitted(client, writer)
+    assert client.post(f"/v1/imports/{session}/admit", headers=writer, json={}).status_code == 200
+    assert client.delete(f"/v1/imports/{session}", headers=writer).status_code == 200
+    module._SOURCE_LIBRARY = None
+    assert client.post(f"/v1/imports/{session}/admit", headers=writer, json={}).status_code == 400
+    assert module._source_library()._read_index()["sessions"][session]["state"] == "rolled_back"
+
+
+def test_admitted_metadata_without_intact_blob_cannot_authorize_reads(boundary):
+    module, client, headers, _ = boundary
+    writer = headers(scopes=INGEST)
+    source, _ = admitted(client, writer)
+    assert client.post("/v1/domain/records", headers=writer, json=record(source)).status_code == 200
+    state = module._source_library()._state
+    state.delete_blob(source)
+    state.put_blob(source, b"different bytes")
+    module._SOURCE_LIBRARY = None
+    assert client.get("/v1/domain/records?domain=health", headers=headers(scopes=["storage.health.read"])).status_code == 409
+    assert client.post("/v1/domain/records", headers=writer, json=record(source)).status_code == 400
+
+
 @pytest.mark.parametrize("references", [None, [], "source", [""], [1], ["duplicate", "duplicate"]])
 def test_malformed_references_denied_before_domain_write(boundary, references):
     module, client, headers, _ = boundary

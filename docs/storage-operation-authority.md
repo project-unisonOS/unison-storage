@@ -34,6 +34,13 @@ the domain commit, preventing concurrent deletion between validation and write.
 The lock order is source then domain; readers release their domain read transaction
 before validating references under the source lock.
 
+Admission checks source/session lifecycle, ownership, session association,
+decryption integrity, byte length and SHA-256 before changing any source state.
+Rejected and rolled-back sessions are terminal; deleted source IDs cannot regain
+admission. Valid intact admission replay remains idempotent. A new import is
+required after rejection, even if bytes are later repaired. Reference checks also
+verify source bytes, so an admitted metadata flag alone cannot authorize a record.
+
 Canonical domain reads validate all referenced sources. If source deletion commits
 but the separate domain cascade fails, subsequent reads fail closed (409), including
 after restart. This prevents that canonical API from returning orphaned records.
