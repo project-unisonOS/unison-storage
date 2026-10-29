@@ -14,6 +14,7 @@ import re
 import secrets
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -273,6 +274,25 @@ class SourceLibrary:
     def list_sources(self, person_id: str) -> list[dict[str, Any]]:
         return [v for v in self._read_index()["sources"].values()
                 if v["person_id"] == person_id and v["state"] != "deleted"]
+
+    @contextmanager
+    def admitted_references(self, person_id: str, source_ids: list[str]):
+        """Validate ownership/admission while holding the source write lock.
+
+        This binds references, not the truth or extraction of supplied facts.
+        The source lock must be acquired before starting a domain transaction.
+        """
+        if (not isinstance(source_ids, list) or not source_ids or len(source_ids) > 5000
+                or any(not isinstance(item, str) or not item or len(item) > 256 for item in source_ids)
+                or len(set(source_ids)) != len(source_ids)):
+            raise IntakeRejected("owned admitted source references required")
+        with self._state.transaction():
+            sources = self._read_index()["sources"]
+            for source_id in source_ids:
+                source = sources.get(source_id)
+                if not source or source["person_id"] != person_id or source["state"] != "admitted":
+                    raise IntakeRejected("owned admitted source references required")
+            yield
 
     @transactional
     def reclassify(self, person_id: str, source_id: str, space_id: str, classification: str) -> dict[str, Any]:
