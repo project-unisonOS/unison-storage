@@ -10,7 +10,10 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from cryptography.fernet import Fernet, InvalidToken
+try:
+    from .encrypted_state import EncryptedState, transactional
+except ImportError:
+    from encrypted_state import EncryptedState, transactional
 
 
 HOUSEHOLD_TYPES = frozenset({
@@ -63,23 +66,19 @@ class LifeDomainStore:
     def __init__(self, root: Path, encryption_key: bytes):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
-        self.state_path = root / "domain-state.enc"
-        self.pending_path = root / "domain-state.pending"
-        self.fernet = Fernet(encryption_key)
-        if not self.state_path.exists():
-            self._write({"records": {}, "links": {}, "attention": {}, "briefs": {}, "drafts": {}, "pilots": {}})
+        if (root / "domain-state.enc").exists() or (root / "domain-state.pending").exists():
+            raise DomainRejected("legacy domain state requires an explicit offline migration")
+        self.state_path = root / "domain-state.sqlite3"
+        self._state = EncryptedState(self.state_path, encryption_key,
+                                    {"records": {}, "links": {}, "attention": {}, "briefs": {}, "drafts": {}, "pilots": {}})
 
     def _read(self) -> dict[str, Any]:
-        try:
-            return json.loads(self.fernet.decrypt(self.state_path.read_bytes()).decode())
-        except (InvalidToken, OSError, json.JSONDecodeError) as exc:
-            raise DomainRejected("encrypted domain state is unavailable") from exc
+        return self._state.read()
 
     def _write(self, state: dict[str, Any]) -> None:
-        self.pending_path.write_bytes(self.fernet.encrypt(json.dumps(state, sort_keys=True).encode()))
-        self.pending_path.chmod(0o600)
-        self.pending_path.replace(self.state_path)
+        self._state.write(state)
 
+    @transactional
     def create_record(self, person_id: str, space_id: str, domain: str, record_type: str,
                       facts: dict[str, Any], source_ids: list[str], evidence_status: str = "observed",
                       confidence: float = 1.0) -> dict[str, Any]:
@@ -102,10 +101,12 @@ class LifeDomainStore:
         self._write(state)
         return record
 
+    @transactional
     def records(self, person_id: str, domain: str | None = None) -> list[dict[str, Any]]:
         return [record for record in self._read()["records"].values()
                 if record["person_id"] == person_id and (domain is None or record["domain"] == domain)]
 
+    @transactional
     def delete_records_from_source(self, person_id: str, source_id: str) -> dict[str, int]:
         state = self._read()
         removed = {rid for rid, record in state["records"].items()
@@ -123,6 +124,7 @@ class LifeDomainStore:
         self._write(state)
         return {"records": len(removed), "links": len(links), "attention": len(attention)}
 
+    @transactional
     def share_record(self, person_id: str, record_id: str, target_space: str,
                      confirmed: bool) -> dict[str, Any]:
         state = self._read()
@@ -135,6 +137,7 @@ class LifeDomainStore:
                                   source["facts"], source["source_ids"], source["evidence_status"],
                                   source["confidence"])
 
+    @transactional
     def reconcile_product(self, person_id: str, label_record_id: str, receipt_record_id: str) -> dict[str, Any]:
         records = {r["record_id"]: r for r in self.records(person_id, "household")}
         label, receipt = records.get(label_record_id), records.get(receipt_record_id)
@@ -147,6 +150,7 @@ class LifeDomainStore:
         return {"match": confidence >= 0.75, "confidence": confidence, "compared": compared,
                 "uncertainty": "No shared exact identifiers" if not compared else None}
 
+    @transactional
     def household_attention(self, person_id: str, recall_feed: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for record in self.records(person_id, "household"):
@@ -167,12 +171,14 @@ class LifeDomainStore:
                                                  "high", _today()))
         return items
 
+    @transactional
     def repair_brief(self, person_id: str, record_ids: list[str]) -> dict[str, Any]:
         records = self._owned_records(person_id, record_ids, "household")
         sources = sorted({sid for record in records for sid in record["source_ids"]})
         return self._brief(person_id, "Repair brief", records, sources,
                            "Draft only. No service appointment, purchase, or physical action was performed.")
 
+    @transactional
     def procedure_brief(self, person_id: str, record_id: str) -> dict[str, Any]:
         records = self._owned_records(person_id, [record_id], "household")
         if records[0]["record_type"] not in {"procedure", "manual"}:
@@ -180,6 +186,7 @@ class LifeDomainStore:
         return self._brief(person_id, "Household procedure", records, records[0]["source_ids"],
                            "Follow the cited manufacturer or owner procedure. No physical actuation was performed.")
 
+    @transactional
     def normalize_fhir(self, person_id: str, source_id: str, resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         mapping = {"MedicationStatement": "medication", "MedicationRequest": "medication",
                    "Condition": "condition", "AllergyIntolerance": "allergy", "Immunization": "immunization",
@@ -197,6 +204,7 @@ class LifeDomainStore:
                                                  facts, [source_id], evidence_status, 1.0))
         return normalized
 
+    @transactional
     def health_safety(self, person_id: str, text: str, source_ids: list[str]) -> dict[str, Any] | None:
         lowered = text.lower()
         for phrase, (severity, guidance) in URGENT_HEALTH_RULES.items():
@@ -207,11 +215,13 @@ class LifeDomainStore:
                         "deterministic_rule": f"urgent-health:{phrase}", "dismisses_professional_care": False}
         return None
 
+    @transactional
     def health_timeline(self, person_id: str) -> list[dict[str, Any]]:
         records = self.records(person_id, "health")
         return sorted(records, key=lambda record: str(record["facts"].get("date") or
                                                        record["facts"].get("effectiveDateTime") or ""))
 
+    @transactional
     def reconcile_health(self, person_id: str) -> list[dict[str, Any]]:
         groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for record in self.records(person_id, "health"):
@@ -221,6 +231,7 @@ class LifeDomainStore:
                  "contradiction": len({json.dumps(r["facts"], sort_keys=True) for r in records}) > 1}
                 for key, records in groups.items() if len(records) > 1]
 
+    @transactional
     def visit_brief(self, person_id: str, record_ids: list[str]) -> dict[str, Any]:
         records = self._owned_records(person_id, record_ids, "health")
         sources = sorted({sid for record in records for sid in record["source_ids"]})
@@ -228,6 +239,7 @@ class LifeDomainStore:
         return self._brief(person_id, "Visit preparation brief", records, sources,
                            f"Uncertain or inferred records: {', '.join(uncertainty) if uncertainty else 'none'}. This is not a diagnosis.")
 
+    @transactional
     def health_trend(self, person_id: str, record_ids: list[str], value_field: str,
                      threshold: float | None = None) -> dict[str, Any]:
         records = self._owned_records(person_id, record_ids, "health")
@@ -240,6 +252,7 @@ class LifeDomainStore:
                                                                   if threshold is not None and point["value"] >= threshold],
                 "interpretation": "descriptive trend only; not a diagnosis"}
 
+    @transactional
     def emergency_card(self, person_id: str, record_ids: list[str], confirmed: bool) -> dict[str, Any]:
         if not confirmed:
             raise DomainRejected("emergency presentation requires explicit selection")
@@ -248,6 +261,7 @@ class LifeDomainStore:
         return {"person_id": person_id, "records": [r for r in records if r["record_type"] in allowed],
                 "selective": True, "expires_after_session": True}
 
+    @transactional
     def finance_reconcile(self, person_id: str, statement_total: float, transaction_record_ids: list[str],
                           tolerance: float = 0.01) -> dict[str, Any]:
         records = self._owned_records(person_id, transaction_record_ids, "finance")
@@ -257,6 +271,7 @@ class LifeDomainStore:
                 "tolerance": tolerance, "reconciled": abs(difference) <= tolerance,
                 "source_ids": sorted({sid for r in records for sid in r["source_ids"]})}
 
+    @transactional
     def finance_attention(self, person_id: str) -> list[dict[str, Any]]:
         transactions = [r for r in self.records(person_id, "finance") if r["record_type"] == "transaction"]
         items: list[dict[str, Any]] = []
@@ -292,6 +307,7 @@ class LifeDomainStore:
                                                  "low", deadline))
         return items
 
+    @transactional
     def cash_flow_forecast(self, person_id: str, horizon_days: int = 30) -> dict[str, Any]:
         records = self.records(person_id, "finance")
         balances = [float(r["facts"].get("amount", 0)) for r in records if r["record_type"] == "balance"]
@@ -303,12 +319,14 @@ class LifeDomainStore:
                 "evidence_status": "inferred", "assumptions": ["Observed balances and recurring records only"],
                 "source_ids": sorted({sid for r in records for sid in r["source_ids"]})}
 
+    @transactional
     def household_finance_view(self, person_id: str, contribution_record_ids: list[str]) -> dict[str, Any]:
         records = self._owned_records(person_id, contribution_record_ids, "finance")
         explicit = [r for r in records if r["facts"].get("include_in_household") is True]
         return {"total": round(sum(float(r["facts"].get("amount", 0)) for r in explicit), 2),
                 "included_record_ids": [r["record_id"] for r in explicit], "implicit_records_included": 0}
 
+    @transactional
     def weekly_finance_brief(self, person_id: str) -> dict[str, Any]:
         items = self.finance_attention(person_id)
         prioritized = sorted(items, key=lambda item: {"high": 3, "medium": 2, "low": 1}.get(item["risk"], 0), reverse=True)[:5]
@@ -317,6 +335,7 @@ class LifeDomainStore:
                            sorted({sid for item in prioritized for sid in item["source_ids"]}),
                            f"{len(prioritized)} exception(s) prioritized. Routine activity is suppressed.")
 
+    @transactional
     def draft(self, person_id: str, action_type: str, record_ids: list[str], recipients: list[str],
               disclosed_fields: list[str], content: str) -> dict[str, Any]:
         records = self._owned_records(person_id, record_ids)
@@ -333,6 +352,7 @@ class LifeDomainStore:
         self._write(state)
         return draft
 
+    @transactional
     def link(self, person_id: str, left_record_id: str, right_record_id: str, purpose: str,
              allowed_fields: list[str], recipients: list[str], approved: bool) -> dict[str, Any]:
         records = self._owned_records(person_id, [left_record_id, right_record_id])
@@ -350,6 +370,7 @@ class LifeDomainStore:
         self._write(state)
         return link
 
+    @transactional
     def unlink(self, person_id: str, link_id: str) -> None:
         state = self._read()
         link = state["links"].get(link_id)
@@ -358,6 +379,7 @@ class LifeDomainStore:
         state["links"].pop(link_id)
         self._write(state)
 
+    @transactional
     def transition_template(self, transition: str) -> dict[str, Any]:
         templates = {
             "moving": ["housing", "utilities", "insurance", "records", "communications", "deadlines"],
@@ -371,6 +393,7 @@ class LifeDomainStore:
             raise DomainRejected("unsupported life transition template")
         return {"transition": transition, "steps": steps, "status": "draft", "requires_person_approval": True}
 
+    @transactional
     def cross_domain_packet(self, person_id: str, link_ids: list[str], packet_type: str,
                             recipients: list[str]) -> dict[str, Any]:
         state = self._read()
@@ -385,6 +408,7 @@ class LifeDomainStore:
         return self.draft(person_id, f"{packet_type}-packet", record_ids, recipients, fields,
                           f"Draft {packet_type} packet using only approved links and fields: {', '.join(fields)}")
 
+    @transactional
     def attention_inbox(self, person_id: str, goals: list[str] | None = None) -> list[dict[str, Any]]:
         items = self.household_attention(person_id) + self.finance_attention(person_id)
         goal_words = {word.lower() for goal in goals or [] for word in goal.split()}
@@ -398,6 +422,7 @@ class LifeDomainStore:
                                      "goal_terms_matched": relevance // 10, "burden": "one review"}
         return sorted(items, key=lambda item: item["rank_score"], reverse=True)
 
+    @transactional
     def pilot_report(self, cohort: str, opted_in: bool, measurements: dict[str, float],
                      boundary_incidents: int = 0, unsafe_actions: int = 0) -> dict[str, Any]:
         if cohort == "opt-in-human" and not opted_in:

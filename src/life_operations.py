@@ -20,6 +20,11 @@ from typing import Any
 
 from cryptography.fernet import Fernet
 
+try:
+    from .encrypted_state import EncryptedState, transactional
+except ImportError:  # direct service-module entrypoint
+    from encrypted_state import EncryptedState, transactional
+
 
 ALLOWED_MEDIA_TYPES = frozenset({
     "application/pdf", "image/jpeg", "image/png", "text/plain", "text/csv",
@@ -60,18 +65,19 @@ class SourceLibrary:
         self.fernet = Fernet(encryption_key)
         self.limits = limits or IntakeLimits()
         self.ocr = ocr
-        self.index_path = root / "source-index.json"
-        if not self.index_path.exists():
-            self._write_index({"sessions": {}, "sources": {}, "fields": {}})
+        if (root / "source-index.json").exists() or (root / "source-index.pending").exists():
+            raise IntakeRejected("legacy source state requires an explicit offline migration")
+        self.index_path = root / "source-state.sqlite3"
+        self._state = EncryptedState(self.index_path, encryption_key,
+                                     {"sessions": {}, "sources": {}, "fields": {}})
 
     def _read_index(self) -> dict[str, Any]:
-        return json.loads(self.index_path.read_text(encoding="utf-8"))
+        return self._state.read()
 
     def _write_index(self, index: dict[str, Any]) -> None:
-        pending = self.index_path.with_suffix(".pending")
-        pending.write_text(json.dumps(index, sort_keys=True, indent=2), encoding="utf-8")
-        pending.replace(self.index_path)
+        self._state.write(index)
 
+    @transactional
     def start(self, person_id: str, space_id: str, channel: str = "file") -> dict[str, Any]:
         if channel not in {"file", "camera", "folder", "share", "provider"}:
             raise IntakeRejected("unsupported intake channel")
@@ -87,6 +93,7 @@ class SourceLibrary:
         self._write_index(index)
         return session
 
+    @transactional
     def ingest(self, session_id: str, filename: str, media_type: str, content: bytes,
                actor_person_id: str | None = None) -> dict[str, Any]:
         filename = Path(filename).name
@@ -95,7 +102,12 @@ class SourceLibrary:
         if media_type not in ALLOWED_MEDIA_TYPES:
             raise IntakeRejected("unsupported media type")
         self._verify_signature(media_type, content)
-        guessed = mimetypes.guess_type(filename)[0]
+        # Use the format contract for supported extensions; Windows application
+        # registrations can otherwise map CSV to an Excel-specific MIME type.
+        expected_extensions = {".csv": "text/csv", ".txt": "text/plain", ".json": "application/json",
+                               ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+                               ".jpeg": "image/jpeg", ".zip": "application/zip"}
+        guessed = expected_extensions.get(Path(filename).suffix.lower()) or mimetypes.guess_type(filename)[0]
         if guessed and media_type not in {guessed, "application/octet-stream"}:
             raise IntakeRejected("declared media type does not match filename")
         self._inspect_archive(media_type, content)
@@ -121,9 +133,7 @@ class SourceLibrary:
             "duplicate_of": (duplicate or {}).get("source_id"),
             "security_flags": self._security_flags(content), "created_at": time.time(),
         }
-        person_dir = self.root / hashlib.sha256(session["person_id"].encode()).hexdigest()
-        person_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        (person_dir / f"{source_id}.enc").write_bytes(self.fernet.encrypt(content))
+        self._state.put_blob(source_id, content)
         index["sources"][source_id] = source
         session["source_ids"].append(source_id)
         session.update(state="preview", checkpoint=f"source:{source_id}", updated_at=time.time())
@@ -217,6 +227,7 @@ class SourceLibrary:
                    if v["person_id"] == person_id and v["filename"] == filename and v["state"] != "deleted"]
         return max(matches, key=lambda item: item["version"], default=None)
 
+    @transactional
     def correct_field(self, person_id: str, source_id: str, field_id: str, value: Any) -> dict[str, Any]:
         index = self._read_index()
         source = index["sources"].get(source_id)
@@ -230,6 +241,15 @@ class SourceLibrary:
         return field
 
     def admit(self, person_id: str, session_id: str) -> dict[str, Any]:
+        # Commit the terminal policy decision before translating it to an error.
+        # Unexpected failures inside the transaction still roll back the batch.
+        session, blocked = self._admit_decision(person_id, session_id)
+        if blocked:
+            raise IntakeRejected("malware policy rejected the import")
+        return session
+
+    @transactional
+    def _admit_decision(self, person_id: str, session_id: str):
         index = self._read_index()
         session = index["sessions"].get(session_id)
         if not session or session["person_id"] != person_id:
@@ -239,20 +259,22 @@ class SourceLibrary:
             source = index["sources"][source_id]
             if "malware-signature" in source["security_flags"]:
                 blocked.append(source_id)
-            else:
-                source["state"] = "admitted"
+        # A mixed batch is rejected as a whole; never partially admit it.
+        if not blocked:
+            for source_id in session["source_ids"]:
+                index["sources"][source_id]["state"] = "admitted"
         session["state"] = "rejected" if blocked else "admitted"
         session["checkpoint"] = session["state"]
         session["updated_at"] = time.time()
         self._write_index(index)
-        if blocked:
-            raise IntakeRejected("malware policy rejected the import")
-        return session
+        return session, bool(blocked)
 
+    @transactional
     def list_sources(self, person_id: str) -> list[dict[str, Any]]:
         return [v for v in self._read_index()["sources"].values()
                 if v["person_id"] == person_id and v["state"] != "deleted"]
 
+    @transactional
     def reclassify(self, person_id: str, source_id: str, space_id: str, classification: str) -> dict[str, Any]:
         index = self._read_index()
         source = index["sources"].get(source_id)
@@ -264,25 +286,26 @@ class SourceLibrary:
         self._write_index(index)
         return source
 
+    @transactional
     def export_source(self, person_id: str, source_id: str) -> bytes:
         index = self._read_index()
         source = index["sources"].get(source_id)
         if not source or source["person_id"] != person_id or source["state"] == "deleted":
             raise IntakeRejected("source not found")
-        person_dir = self.root / hashlib.sha256(person_id.encode()).hexdigest()
-        return self.fernet.decrypt((person_dir / f"{source_id}.enc").read_bytes())
+        return self._state.get_blob(source_id)
 
+    @transactional
     def delete_source(self, person_id: str, source_id: str) -> None:
         index = self._read_index()
         source = index["sources"].get(source_id)
         if not source or source["person_id"] != person_id:
             raise IntakeRejected("source not found")
-        person_dir = self.root / hashlib.sha256(person_id.encode()).hexdigest()
-        (person_dir / f"{source_id}.enc").unlink(missing_ok=True)
+        self._state.delete_blob(source_id)
         index["fields"].pop(source_id, None)
         source.update(state="deleted", checksum_sha256="", size_bytes=0)
         self._write_index(index)
 
+    @transactional
     def rollback(self, person_id: str, session_id: str) -> None:
         index = self._read_index()
         session = index["sessions"].get(session_id)
@@ -291,8 +314,7 @@ class SourceLibrary:
         for source_id in list(session["source_ids"]):
             source = index["sources"].get(source_id)
             if source:
-                person_dir = self.root / hashlib.sha256(person_id.encode()).hexdigest()
-                (person_dir / f"{source_id}.enc").unlink(missing_ok=True)
+                self._state.delete_blob(source_id)
                 index["fields"].pop(source_id, None)
                 index["sources"].pop(source_id, None)
         session.update(state="rolled_back", checkpoint="rolled_back", updated_at=time.time())
