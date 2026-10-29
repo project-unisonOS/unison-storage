@@ -19,7 +19,17 @@ Synthetic unit/component tests cover encrypted original and derived content,
 wrong keys, restart, concurrent sessions across threads and processes,
 extraction failure after blob insertion, deletion, and preservation of legacy
 files. Initial baseline tests reproduced three failures. The expanded suite plus
-existing intake tests passes 15 cases locally on Windows/Python 3.12.
+existing intake tests initially passed 15 cases locally on Windows/Python 3.12.
+
+The review follow-up reproduces and fixes a terminal-rejection rollback: a
+malware-rejected mixed batch now commits its rejection before returning an error,
+and none of its sources become admitted. Reopening the store retains rejection.
+Domain records now use the same encrypted transaction mechanism; legacy domain
+files are refused for explicit offline migration rather than silently replaced.
+Additional synthetic tests cover domain writer concurrency, concurrent source
+ingestion/deletion, and abrupt worker-process death between writes and commit.
+The expanded full local suite passes 48 tests. This is not physical power-loss
+or disk-full evidence; final hosted checks and independent review remain pending.
 
 Supported filename extensions use the documented MIME contract so host-specific
 Windows application registrations do not reinterpret CSV as an Excel format.
@@ -28,7 +38,7 @@ Content signature and declared-type checks remain in place.
 ## Limits and next packet
 
 This is not whole-system encryption or private-data release approval. Other
-domain/incident/resolution persistence, key custody, backup retention and
+incident/resolution persistence, key custody, backup retention and
 revocation, authenticated integration, power-loss qualification, disk-full
 behavior and independent security review require their own evidence. SQLite
 serialization is suitable for this small initial store; larger-scale indexing

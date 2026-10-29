@@ -240,8 +240,16 @@ class SourceLibrary:
         self._write_index(index)
         return field
 
-    @transactional
     def admit(self, person_id: str, session_id: str) -> dict[str, Any]:
+        # Commit the terminal policy decision before translating it to an error.
+        # Unexpected failures inside the transaction still roll back the batch.
+        session, blocked = self._admit_decision(person_id, session_id)
+        if blocked:
+            raise IntakeRejected("malware policy rejected the import")
+        return session
+
+    @transactional
+    def _admit_decision(self, person_id: str, session_id: str):
         index = self._read_index()
         session = index["sessions"].get(session_id)
         if not session or session["person_id"] != person_id:
@@ -251,15 +259,15 @@ class SourceLibrary:
             source = index["sources"][source_id]
             if "malware-signature" in source["security_flags"]:
                 blocked.append(source_id)
-            else:
-                source["state"] = "admitted"
+        # A mixed batch is rejected as a whole; never partially admit it.
+        if not blocked:
+            for source_id in session["source_ids"]:
+                index["sources"][source_id]["state"] = "admitted"
         session["state"] = "rejected" if blocked else "admitted"
         session["checkpoint"] = session["state"]
         session["updated_at"] = time.time()
         self._write_index(index)
-        if blocked:
-            raise IntakeRejected("malware policy rejected the import")
-        return session
+        return session, bool(blocked)
 
     @transactional
     def list_sources(self, person_id: str) -> list[dict[str, Any]]:

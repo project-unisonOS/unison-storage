@@ -2,15 +2,77 @@
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from pathlib import Path
 import time
+import multiprocessing
+import os
 
 import pytest
 from cryptography.fernet import Fernet
 from src.life_operations import SourceLibrary
+from src.life_operations import IntakeRejected
+
+
+def test_rejected_mixed_batch_stays_rejected_after_restart(tmp_path):
+    key = Fernet.generate_key()
+    library = SourceLibrary(tmp_path, key)
+    session = library.start("synthetic-alice", "private:synthetic-alice")
+    library.ingest(session["session_id"], "safe.txt", "text/plain", b"synthetic safe")
+    library.ingest(session["session_id"], "blocked.txt", "text/plain",
+                   b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE")
+    for instance in (library, SourceLibrary(tmp_path, key)):
+        with pytest.raises(IntakeRejected, match="malware"):
+            instance.admit("synthetic-alice", session["session_id"])
+        state = SourceLibrary(tmp_path, key)._read_index()
+        assert state["sessions"][session["session_id"]]["state"] == "rejected"
+        assert all(source["state"] != "admitted" for source in state["sources"].values())
 
 
 def _start_in_process(arguments):
     path, key = arguments
     return SourceLibrary(Path(path), key).start("synthetic-alice", "private:synthetic-alice")["session_id"]
+
+
+def _crash_during_transaction(path, key):
+    library = SourceLibrary(Path(path), key)
+    with library._state.transaction():
+        library._state.put_blob("interrupted", b"synthetic-uncommitted")
+        library.start("synthetic-crashed", "private:synthetic-crashed")
+        os._exit(19)
+
+
+def test_process_death_rolls_back_metadata_and_blobs(tmp_path):
+    import sqlite3
+    key = Fernet.generate_key()
+    SourceLibrary(tmp_path, key).start("synthetic-alice", "private:synthetic-alice")
+    process = multiprocessing.get_context("spawn").Process(target=_crash_during_transaction, args=(str(tmp_path), key))
+    process.start()
+    process.join(timeout=15)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        pytest.fail("synthetic crash worker did not finish")
+    assert process.exitcode == 19
+    restored = SourceLibrary(tmp_path, key)
+    assert len(restored._read_index()["sessions"]) == 1
+    with sqlite3.connect(restored.index_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 0
+
+
+def test_concurrent_ingestion_and_deletion_remain_consistent(tmp_path):
+    key = Fernet.generate_key()
+    libraries = [SourceLibrary(tmp_path, key) for _ in range(4)]
+    session = libraries[0].start("synthetic-alice", "private:synthetic-alice")
+    def ingest(i):
+        return libraries[i % 4].ingest(session["session_id"], f"fixture-{i}.txt", "text/plain", f"synthetic {i}".encode())
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        sources = list(pool.map(ingest, range(12)))
+    restored = SourceLibrary(tmp_path, key)
+    assert len(restored._read_index()["sessions"][session["session_id"]]["source_ids"]) == 12
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda i: libraries[i % 4].delete_source("synthetic-alice", sources[i]["source_id"]), range(6)))
+    restored = SourceLibrary(tmp_path, key)
+    assert {s["source_id"] for s in restored.list_sources("synthetic-alice")} == {s["source_id"] for s in sources[6:]}
+    for source in sources[6:]:
+        assert restored.export_source("synthetic-alice", source["source_id"]).startswith(b"synthetic")
 
 
 def test_derivatives_are_encrypted_at_rest(tmp_path):
