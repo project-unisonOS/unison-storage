@@ -20,3 +20,13 @@ def decode_unique(raw):
         return result
     return json.loads(raw, object_pairs_hook=unique)
 
+
+
+from typing import Protocol
+
+class SourceAdapter(Protocol):
+    identifier: str
+    purpose: str
+    def extract(self, raw: bytes, person: str, source_id: str, ingested_at: str,
+                source_sha256: str) -> tuple[list[dict], int]: ...
+    def present(self, records: list[dict]) -> tuple[list[dict], str]: ...

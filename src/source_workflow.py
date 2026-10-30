@@ -31,6 +31,7 @@ def initialize_authority(path: Path, key: bytes, schema=VERSION):
 class SourceWorkflow:
     policy_version = VERSION
     id_prefix = "source_"
+    legacy_adapter_id = None
     def __init__(self, root: Path, authority_path: Path, key: bytes, adapter_id: str):
         if adapter_id not in ADAPTERS:
             raise PilotDenied("source adapter not qualified")
@@ -48,7 +49,7 @@ class SourceWorkflow:
     def _grant(self, state, person, wid, *, active=True):
         grant = state["grants"].get(wid)
         if (not grant or grant["person_id"] != person
-                or grant.get("adapter_id", "synthetic-health-export.v1") != self.adapter.identifier):
+                or grant.get("adapter_id", self.legacy_adapter_id) != self.adapter.identifier):
             raise PilotDenied("workflow unavailable")
         if active and (grant["state"] != "active" or grant["expires_at"] <= time.time()
                        or grant["policy_version"] != self.policy_version):
