@@ -31,8 +31,9 @@ except Exception:
 from collections import defaultdict
 
 from settings import StorageServiceSettings
+from storage_authority import require_storage_operation
 
-app = FastAPI(title="unison-storage")
+app = FastAPI(title="unison-storage", dependencies=[Depends(require_storage_operation)])
 app.add_middleware(TracingMiddleware, service_name="unison-storage")
 if BatonMiddleware:
     app.add_middleware(BatonMiddleware)
@@ -746,19 +747,33 @@ def domain_record_create(request: Request, body: dict = Body(...), principal=Dep
         person_id = _life_person(request, principal, body.get("person_id"))
         domain = body.get("domain", "")
         default_space = f"{domain}:{person_id}" if domain in {"health", "finance"} else f"private:{person_id}"
-        return _domain_store().create_record(
-            person_id, body.get("space_id") or default_space, domain, body.get("record_type", ""),
-            body.get("facts", {}), body.get("source_ids", []), body.get("evidence_status", "observed"),
-            float(body.get("confidence", 1.0)),
-        )
-    except (DomainRejected, TypeError, ValueError) as exc:
+        # Hold the source transaction until the domain commit completes. A
+        # concurrent delete cannot invalidate the reference between check/write.
+        with _source_library().admitted_references(person_id, body.get("source_ids")):
+            return _domain_store().create_record(
+                person_id, body.get("space_id") or default_space, domain, body.get("record_type", ""),
+                body.get("facts", {}), body.get("source_ids", []), body.get("evidence_status", "observed"),
+                float(body.get("confidence", 1.0)),
+            )
+    except (DomainRejected, IntakeRejected, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/v1/domain/records")
 def domain_records(request: Request, domain: str | None = None, person_id: str | None = None,
                    principal=Depends(_check_auth)):
-    return {"records": _domain_store().records(_life_person(request, principal, person_id), domain)}
+    person = _life_person(request, principal, person_id)
+    records = _domain_store().records(person, domain)
+    if not records:
+        return {"records": []}
+    try:
+        references = sorted({sid for record in records for sid in record["source_ids"]})
+        with _source_library().admitted_references(person, references):
+            return {"records": records}
+    except (IntakeRejected, TypeError, KeyError):
+        # Deleted/rejected sources can leave encrypted orphans if the second
+        # database cascade fails. Do not disclose those derivatives.
+        raise HTTPException(409, "domain source references unavailable") from None
 
 
 @app.post("/v1/domain/records/{record_id}/share")

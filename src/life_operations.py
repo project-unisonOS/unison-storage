@@ -14,11 +14,12 @@ import re
 import secrets
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 try:
     from .encrypted_state import EncryptedState, transactional
@@ -245,7 +246,7 @@ class SourceLibrary:
         # Unexpected failures inside the transaction still roll back the batch.
         session, blocked = self._admit_decision(person_id, session_id)
         if blocked:
-            raise IntakeRejected("malware policy rejected the import")
+            raise IntakeRejected("source policy rejected the import (malware, lifecycle or integrity)")
         return session
 
     @transactional
@@ -254,10 +255,19 @@ class SourceLibrary:
         session = index["sessions"].get(session_id)
         if not session or session["person_id"] != person_id:
             raise IntakeRejected("session not found")
+        if session["state"] in {"rejected", "rolled_back"}:
+            return session, True  # Terminal states never regain admission authority.
         blocked = []
+        expected_state = "admitted" if session["state"] == "admitted" else "quarantined"
+        if session["state"] not in {"preview", "admitted"} or not session["source_ids"]:
+            blocked.append("invalid-session")
         for source_id in session["source_ids"]:
-            source = index["sources"][source_id]
-            if "malware-signature" in source["security_flags"]:
+            source = index["sources"].get(source_id)
+            if (not source or source["person_id"] != person_id
+                    or source.get("import_session_id") != session_id
+                    or source["state"] != expected_state
+                    or "malware-signature" in source["security_flags"]
+                    or not self._source_bytes_intact(source)):
                 blocked.append(source_id)
         # A mixed batch is rejected as a whole; never partially admit it.
         if not blocked:
@@ -269,10 +279,39 @@ class SourceLibrary:
         self._write_index(index)
         return session, bool(blocked)
 
+    def _source_bytes_intact(self, source: dict[str, Any]) -> bool:
+        """Called under the source transaction; decrypted bytes are never logged."""
+        try:
+            content = self._state.get_blob(source["source_id"])
+            return (len(content) == source["size_bytes"]
+                    and hashlib.sha256(content).hexdigest() == source["checksum_sha256"])
+        except (ValueError, InvalidToken, KeyError, TypeError):
+            return False
+
     @transactional
     def list_sources(self, person_id: str) -> list[dict[str, Any]]:
         return [v for v in self._read_index()["sources"].values()
                 if v["person_id"] == person_id and v["state"] != "deleted"]
+
+    @contextmanager
+    def admitted_references(self, person_id: str, source_ids: list[str]):
+        """Validate ownership/admission while holding the source write lock.
+
+        This binds references, not the truth or extraction of supplied facts.
+        The source lock must be acquired before starting a domain transaction.
+        """
+        if (not isinstance(source_ids, list) or not source_ids or len(source_ids) > 5000
+                or any(not isinstance(item, str) or not item or len(item) > 256 for item in source_ids)
+                or len(set(source_ids)) != len(source_ids)):
+            raise IntakeRejected("owned admitted source references required")
+        with self._state.transaction():
+            sources = self._read_index()["sources"]
+            for source_id in source_ids:
+                source = sources.get(source_id)
+                if (not source or source["person_id"] != person_id or source["state"] != "admitted"
+                        or not self._source_bytes_intact(source)):
+                    raise IntakeRejected("owned admitted source references required")
+            yield
 
     @transactional
     def reclassify(self, person_id: str, source_id: str, space_id: str, classification: str) -> dict[str, Any]:
