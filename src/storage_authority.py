@@ -25,6 +25,13 @@ OPERATION_SCOPES = {
     "pilot_consent": "storage.health.consent", "pilot_revoke": "storage.health.consent",
     "pilot_extract": "storage.health.extract", "pilot_records": "storage.health.pilot.read",
     "pilot_authorize": "storage.health.pilot.read",
+    "workflow_consent": "storage.health.workflow.consent",
+    "workflow_upload": "storage.health.workflow.import",
+    "workflow_view": "storage.health.workflow.read",
+    "workflow_revoke": "storage.health.workflow.consent",
+    "workflow_delete": "storage.health.workflow.delete",
+    "workflow_backup": "storage.health.workflow.backup",
+    "workflow_restore": "storage.health.workflow.restore",
 }
 
 

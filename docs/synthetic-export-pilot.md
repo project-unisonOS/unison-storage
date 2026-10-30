@@ -80,3 +80,9 @@ concurrent extraction/deletion, rollback and failure before/after domain commit.
 The workspace's `test_export_health_pilot.py` checks actual ASGI intake through a
 brief, with no manual fact insertion, and revokes between read and presentation.
 All fixtures are synthetic. Hosted CI is not physical power-loss evidence.
+
+## Browser workflow candidate
+
+See [synthetic health experience](synthetic-health-experience.md). It adds
+prospective consent and a separate non-restored authority ledger for a bounded
+workflow. It does not upgrade general backup restore or admit real records.

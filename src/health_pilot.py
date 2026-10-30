@@ -91,6 +91,30 @@ def decode_unique(raw):
     return json.loads(raw, object_pairs_hook=unique)
 
 
+def records_from_export(raw, person, source_id, grant_id, ingested_at, source_sha256):
+    export = Export.model_validate(decode_unique(raw))
+    records, seen = [], {}
+    for position, row in enumerate(export.observations):
+        original = row.model_dump()
+        key = (row.source, row.upstream_id, row.metric, row.revision)
+        if key in seen and seen[key] != original:
+            raise PilotDenied("conflicting export revision")
+        if key in seen:
+            continue
+        seen[key] = original
+        fact = dict(original, synthetic=True, person_id=person,
+                    observation_id=f"{source_id}:{position}", source_record_id=source_id,
+                    ingestion_source="synthetic-export", ingested_at=ingested_at,
+                    consent_id=grant_id, transformation_version="synthetic-observation.v1",
+                    original_payload=original)
+        provenance = dict(parser_version=PARSER_VERSION, source_sha256=source_sha256,
+                          row_pointer=f"/observations/{position}", fact_sha256=digest(fact))
+        records.append(dict(record_id=f"{source_id}:{position}", person_id=person, domain="health",
+                            record_type="wearable-observation", shared=False, evidence_status="observed",
+                            facts=fact, source_ids=[source_id], provenance=provenance))
+    return records
+
+
 class HealthPilot:
     def __init__(self, library, enabled=False):
         self.library = library
@@ -149,27 +173,7 @@ class HealthPilot:
         if source["media_type"] != "application/json" or source["size_bytes"] > 1024 * 1024:
             raise PilotDenied("bounded JSON export required")
         raw = self.library._state.get_blob(source_id)
-        export = Export.model_validate(decode_unique(raw))
-        records, seen = [], {}
-        for position, row in enumerate(export.observations):
-            original = row.model_dump()
-            key = (row.source, row.upstream_id, row.metric, row.revision)
-            if key in seen and seen[key] != original:
-                raise PilotDenied("conflicting export revision")
-            if key in seen:
-                continue
-            seen[key] = original
-            fact = dict(original, synthetic=True, person_id=person,
-                        observation_id=f"{source_id}:{position}", source_record_id=source_id,
-                        ingestion_source="synthetic-export", ingested_at=ingested_at,
-                        consent_id=grant_id, transformation_version="synthetic-observation.v1",
-                        original_payload=original)
-            provenance = dict(parser_version=PARSER_VERSION, source_sha256=source["checksum_sha256"],
-                              row_pointer=f"/observations/{position}", fact_sha256=digest(fact))
-            records.append(dict(record_id=f"{source_id}:{position}", person_id=person, domain="health",
-                                record_type="wearable-observation", shared=False, evidence_status="observed",
-                                facts=fact, source_ids=[source_id], provenance=provenance))
-        return records
+        return records_from_export(raw, person, source_id, grant_id, ingested_at, source["checksum_sha256"])
 
     def extract(self, person, source_id, grant_id):
         with self.library._state.transaction():
