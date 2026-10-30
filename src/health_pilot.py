@@ -5,8 +5,6 @@ owner grant must match the fixed purpose/version at every operation. It shares
 the source transaction so revocation, extraction and deletion serialize. This is
 an in-process reference monitor, not protection from a compromised storage host.
 """
-import hashlib
-import json
 import secrets
 import time
 from datetime import date, datetime, timezone
@@ -14,14 +12,11 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from source_contracts import PilotDenied, decode_unique, digest
 
 POLICY_VERSION = "synthetic-health-policy.v1"
 PARSER_VERSION = "synthetic-export.v1"
 PURPOSE = "wellness.summary"
-
-
-class PilotDenied(ValueError):
-    pass
 
 
 class ExportRow(BaseModel):
@@ -76,19 +71,6 @@ class Export(BaseModel):
         return value
 
 
-def digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-
-
-def decode_unique(raw):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate JSON key")
-            result[key] = value
-        return result
-    return json.loads(raw, object_pairs_hook=unique)
 
 
 def records_from_export(raw, person, source_id, grant_id, ingested_at, source_sha256):
