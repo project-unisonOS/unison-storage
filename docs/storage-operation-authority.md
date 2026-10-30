@@ -64,3 +64,9 @@ missing/expired/wrong-audience/workload/wildcard authority, direct revocation,
 invalid source states, malformed references, alternate JSON identity hints,
 restart after an interrupted cascade, and simultaneous create/delete locking.
 Component and workspace CI are recorded in the implementation checkpoint.
+
+## Synthetic export pilot candidate
+
+See [synthetic export prerequisite contract](synthetic-export-pilot.md) for the
+separate default-disabled consent/extraction API and deletion outbox. These do
+not upgrade legacy manually posted records to verified pilot evidence.

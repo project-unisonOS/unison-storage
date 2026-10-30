@@ -21,6 +21,10 @@ OPERATION_SCOPES = {
     "sources_list": "storage.sources.read", "source_correct": "storage.sources.correct",
     "source_delete": "storage.sources.delete", "domain_record_create": "storage.domain.create",
     "domain_records": "storage.domain.read",
+    "source_recover": "storage.sources.delete",
+    "pilot_consent": "storage.health.consent", "pilot_revoke": "storage.health.consent",
+    "pilot_extract": "storage.health.extract", "pilot_records": "storage.health.pilot.read",
+    "pilot_authorize": "storage.health.pilot.read",
 }
 
 
