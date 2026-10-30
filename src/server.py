@@ -18,6 +18,7 @@ import base64
 import os
 import uuid
 import hashlib
+import sqlite3
 from datetime import datetime
 from cryptography.fernet import Fernet, InvalidToken
 from life_operations import ConnectionBroker, ConnectionRejected, IntakeRejected, SourceLibrary
@@ -33,6 +34,7 @@ from collections import defaultdict
 from settings import StorageServiceSettings
 from storage_authority import require_storage_operation
 from health_pilot import HealthPilot, PilotDenied
+from health_workflow import HealthWorkflow
 
 app = FastAPI(title="unison-storage", dependencies=[Depends(require_storage_operation)])
 app.add_middleware(TracingMiddleware, service_name="unison-storage")
@@ -1056,6 +1058,74 @@ def incident_read(incident_id: str, request: Request, body: dict = Body(...), pr
         return {"incident": incident.model_dump(mode="json"), "observations": observations}
     except IncidentRejected as exc:
         raise HTTPException(status_code=404, detail="incident unavailable") from exc
+
+
+
+# Separate, default-disabled browser workflow. Authority is never restored from data backups.
+def _health_flow(request, method, *args):
+    if os.getenv("UNISON_SYNTHETIC_HEALTH_WORKFLOW") != "true":
+        raise HTTPException(403, "synthetic workflow disabled")
+    try:
+        bound = get_bound_principal(request)
+        if not bound.person_id or bound.principal_kind.value != "person":
+            raise ValueError("person required")
+        root = Path(os.environ["UNISON_HEALTH_WORKFLOW_ROOT"])
+        ledger = Path(os.environ["UNISON_HEALTH_AUTHORITY_PATH"])
+        service = HealthWorkflow(root, ledger, os.environ["STORAGE_OBJECT_ENC_KEY"].encode())
+        return getattr(service, method)(bound.person_id, *args)
+    except (ValueError, KeyError, TypeError, RuntimeError, InvalidToken, OSError, sqlite3.Error):
+        raise HTTPException(403, "Workflow unavailable. Check consent, supported export, and retained authority.") from None
+
+
+@app.post("/v1/health-workflows")
+def workflow_consent(request: Request, body: dict = Body(...)):
+    return _health_flow(request, "consent", body)
+
+
+@app.post("/v1/health-workflows/{wid}/upload")
+def workflow_upload(wid: str, request: Request, body: dict = Body(...)):
+    if set(body) != {"content_b64"}:
+        raise HTTPException(400, "only the consented export is accepted")
+    try:
+        raw = base64.b64decode(body["content_b64"], validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "invalid export encoding") from None
+    return _health_flow(request, "upload", wid, raw)
+
+
+@app.get("/v1/health-workflows/{wid}")
+def workflow_view(wid: str, request: Request):
+    return _health_flow(request, "view", wid)
+
+
+@app.post("/v1/health-workflows/{wid}/revoke")
+def workflow_revoke(wid: str, request: Request):
+    return _health_flow(request, "terminate", wid, "revoked")
+
+
+@app.delete("/v1/health-workflows/{wid}")
+def workflow_delete(wid: str, request: Request):
+    return _health_flow(request, "terminate", wid, "deleted")
+
+
+@app.post("/v1/health-workflows/{wid}/backup")
+def workflow_backup(wid: str, request: Request):
+    return _health_flow(request, "backup", wid)
+
+
+@app.post("/v1/health-workflows/{wid}/restore")
+def workflow_restore(wid: str, request: Request, body: dict = Body(...)):
+    if set(body) != {"snapshot_id"}: raise HTTPException(400, "snapshot reference required")
+    return _health_flow(request, "restore", wid, body["snapshot_id"])
+
+
+@app.middleware("http")
+async def workflow_no_store(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/v1/health-workflows"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 if __name__ == "__main__":
