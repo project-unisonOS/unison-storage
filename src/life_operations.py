@@ -342,7 +342,27 @@ class SourceLibrary:
         self._state.delete_blob(source_id)
         index["fields"].pop(source_id, None)
         source.update(state="deleted", checksum_sha256="", size_bytes=0)
+        index.setdefault("pilot_extractions", {}).pop(source_id, None)
+        index.setdefault("deletions", {}).setdefault(source_id, {
+            "person_id": person_id, "state": "pending"})
         self._write_index(index)
+
+    @transactional
+    def recover_deletions(self, person_id: str, domain_store) -> dict[str, int]:
+        """Replay a durable outbox; source lock precedes domain lock everywhere.
+
+        A failed domain commit leaves the source tombstone and pending job intact.
+        A crash after domain commit merely repeats an idempotent cascade.
+        """
+        index = self._read_index()
+        completed = 0
+        for source_id, job in index.get("deletions", {}).items():
+            if job["person_id"] == person_id and job["state"] == "pending":
+                domain_store.delete_records_from_source(person_id, source_id)
+                job["state"] = "complete"
+                completed += 1
+        self._write_index(index)
+        return {"completed": completed}
 
     @transactional
     def rollback(self, person_id: str, session_id: str) -> None:
@@ -355,7 +375,10 @@ class SourceLibrary:
             if source:
                 self._state.delete_blob(source_id)
                 index["fields"].pop(source_id, None)
-                index["sources"].pop(source_id, None)
+                source.update(state="deleted", checksum_sha256="", size_bytes=0)
+                index.setdefault("pilot_extractions", {}).pop(source_id, None)
+                index.setdefault("deletions", {}).setdefault(source_id, {
+                    "person_id": person_id, "state": "pending"})
         session.update(state="rolled_back", checkpoint="rolled_back", updated_at=time.time())
         self._write_index(index)
 

@@ -32,6 +32,7 @@ from collections import defaultdict
 
 from settings import StorageServiceSettings
 from storage_authority import require_storage_operation
+from health_pilot import HealthPilot, PilotDenied
 
 app = FastAPI(title="unison-storage", dependencies=[Depends(require_storage_operation)])
 app.add_middleware(TracingMiddleware, service_name="unison-storage")
@@ -645,7 +646,9 @@ def import_admit(session_id: str, request: Request, body: dict = Body(default={}
 @app.delete("/v1/imports/{session_id}")
 def import_rollback(session_id: str, request: Request, person_id: str | None = None, principal=Depends(_check_auth)):
     try:
-        _source_library().rollback(_life_person(request, principal, person_id), session_id)
+        person = _life_person(request, principal, person_id)
+        _source_library().rollback(person, session_id)
+        _source_library().recover_deletions(person, _domain_store())
         return {"ok": True}
     except IntakeRejected as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -671,10 +674,56 @@ def source_delete(source_id: str, request: Request, person_id: str | None = None
     try:
         bound_person = _life_person(request, principal, person_id)
         _source_library().delete_source(bound_person, source_id)
-        cascade = _domain_store().delete_records_from_source(bound_person, source_id)
+        cascade = _source_library().recover_deletions(bound_person, _domain_store())
         return {"ok": True, "deleted": source_id, "derived_cascade": cascade}
     except IntakeRejected as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/v1/sources/recover-deletions")
+def source_recover(request: Request, principal=Depends(_check_auth)):
+    return _source_library().recover_deletions(_life_person(request, principal, None), _domain_store())
+
+
+def _pilot_call(request, principal, method, *args):
+    person = _life_person(request, principal, None)
+    pilot = HealthPilot(_source_library(), os.getenv("UNISON_SYNTHETIC_HEALTH_PILOT") == "true")
+    try:
+        return getattr(pilot, method)(person, *args)
+    except (PilotDenied, IntakeRejected, ValueError, KeyError, TypeError):
+        raise HTTPException(403, "synthetic health consent, policy or source validation denied") from None
+
+
+@app.post("/v1/health-pilot/consents")
+def pilot_consent(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    if set(body) != {"source_ids", "expires_at", "purpose", "confirmed"}:
+        raise HTTPException(400, "exact consent fields required")
+    return _pilot_call(request, principal, "grant", body["source_ids"], body["expires_at"],
+                       body["purpose"], body["confirmed"])
+
+
+@app.delete("/v1/health-pilot/consents/{grant_id}")
+def pilot_revoke(grant_id: str, request: Request, principal=Depends(_check_auth)):
+    return _pilot_call(request, principal, "revoke", grant_id)
+
+
+@app.post("/v1/health-pilot/sources/{source_id}/extract")
+def pilot_extract(source_id: str, request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    if set(body) != {"grant_id"}:
+        raise HTTPException(400, "only a consent reference is accepted; facts come from source bytes")
+    return _pilot_call(request, principal, "extract", source_id, body["grant_id"])
+
+
+@app.get("/v1/health-pilot/records")
+def pilot_records(request: Request, grant_id: str, principal=Depends(_check_auth)):
+    return _pilot_call(request, principal, "read", grant_id)
+
+
+@app.post("/v1/health-pilot/authorize")
+def pilot_authorize(request: Request, body: dict = Body(...), principal=Depends(_check_auth)):
+    if set(body) != {"grant_id", "action"} or body["action"] not in {"read", "present"}:
+        raise HTTPException(400, "bounded policy action required")
+    return _pilot_call(request, principal, "authorize", body["grant_id"], body["action"])
 
 
 @app.get("/v1/connections/catalog")
